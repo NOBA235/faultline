@@ -221,6 +221,33 @@ const MIGRATIONS = [
   CREATE INDEX idx_assertions_project ON assertion_results (project_id, check_id);
   CREATE INDEX idx_assertions_run ON assertion_results (run_id);
   `,
+  // version 6: AI test engineer (validated test plans and evidence-based run analyses)
+  `
+  CREATE TABLE ai_test_plans (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects (id) ON DELETE CASCADE,
+    prompt TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    spec_json TEXT NOT NULL,
+    validation_status TEXT NOT NULL CHECK (validation_status IN ('valid', 'invalid')),
+    validation_errors_json TEXT,
+    matched_event_id TEXT REFERENCES webhook_events (id) ON DELETE SET NULL,
+    executed_run_id TEXT REFERENCES scenario_runs (id) ON DELETE SET NULL,
+    created_at TEXT NOT NULL
+  );
+  CREATE INDEX idx_ai_plans_project ON ai_test_plans (project_id, created_at DESC);
+
+  CREATE TABLE ai_run_analyses (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL UNIQUE REFERENCES scenario_runs (id) ON DELETE CASCADE,
+    project_id TEXT NOT NULL REFERENCES projects (id) ON DELETE CASCADE,
+    provider TEXT NOT NULL,
+    analysis_json TEXT NOT NULL,
+    evidence_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL
+  );
+  CREATE INDEX idx_ai_analyses_project ON ai_run_analyses (project_id, created_at DESC);
+  `,
 ];
 
 function openDb(file) {

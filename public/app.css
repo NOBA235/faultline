@@ -136,3 +136,11 @@ ul.plain li + li { margin-top: 4px; }
 ul.evidence { margin-top: 6px; }
 .btn-row { display: flex; gap: 8px; }
 .actions-left { display: flex; flex-wrap: wrap; gap: 8px; }
+
+h3.subsection { font-size: 13px; font-weight: 600; color: var(--ink); margin-bottom: 8px; }
+h3.subsection.nomargin { margin: 0; }
+h3.subsection.spaced { margin-top: 16px; }
+.spec-box { margin-top: 16px; padding: 16px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); }
+.quick-prompts { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-bottom: 12px; }
+.btn.small { padding: 3px 10px; font-size: 12px; }
+.ai-analysis { margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--line); }

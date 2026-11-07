@@ -95,12 +95,14 @@ function registerScenarioRoutes({ app, db, forwarder, requireAuth, getProjectRow
     const assertions = db.prepare('SELECT * FROM assertion_results WHERE run_id = ? ORDER BY id').all(run.id).map((a) => ({
       id: a.check_id, category: a.category, name: a.name, verdict: a.verdict, summary: a.summary, evidence: JSON.parse(a.evidence_json),
     }));
+    const aiRow = db.prepare('SELECT * FROM ai_run_analyses WHERE run_id = ?').get(run.id);
     res.json({
       run: publicRun(run),
       attempts: attempts.map(publicAttempt),
       assertions,
       snapshots: forwarder.evidence.snapshotsFor(run.id),
       result: forwarder.buildResult(run, attempts, event),
+      aiAnalysis: aiRow ? { id: aiRow.id, provider: aiRow.provider, evidenceHash: aiRow.evidence_hash, createdAt: aiRow.created_at, ...JSON.parse(aiRow.analysis_json) } : null,
       event: { id: event.id, paypalEventId: event.paypal_event_id, eventType: event.event_type, receivedAt: event.first_received_at, processingStatus: event.processing_status },
     });
   });
@@ -113,4 +115,4 @@ function registerScenarioRoutes({ app, db, forwarder, requireAuth, getProjectRow
   });
 }
 
-module.exports = { registerScenarioRoutes };
+module.exports = { registerScenarioRoutes, parseScenarioInput };

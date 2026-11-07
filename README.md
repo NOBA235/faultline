@@ -4,7 +4,7 @@ Faultline tests whether a payment integration survives duplicated, delayed, drop
 
 > Don't just test whether your payment works. Test whether it survives failure.
 
-## Status: Phase 5 of 6
+## Status: Phase 6 of 6 (Complete)
 
 | Phase | Scope | Status |
 |---|---|---|
@@ -12,10 +12,8 @@ Faultline tests whether a payment integration survives duplicated, delayed, drop
 | 2 | Create, retrieve and capture Sandbox orders; capture details; log of every PayPal call | Built |
 | 3 | Webhook receiver, PayPal signature verification, event storage, event explorer | Built |
 | 4 | Forwarding to your endpoint, fault injection (duplicate, delay, drop, replay), scenario results | Built |
-| 5 | Deterministic safety checks, verdicts, overview, reports and exports | **Built (this release)** |
-| 6 | AI test engineer | Not built |
-
-Nothing from phases 2 to 6 is simulated. Those parts do not exist yet, and the UI does not show buttons for them.
+| 5 | Deterministic safety checks, verdicts, overview, reports and exports | Built |
+| 6 | AI test engineer (plain-English test planning, evidence-based failure analysis, test suggestions) | **Built (this release)** |
 
 ## What phase 1 does
 
@@ -216,6 +214,53 @@ How to set up the scenarios for the harder checks:
 - **Reports and reliability findings** groups failed checks across runs, shows checks that were never evaluated, and attaches general guidance for each kind of failure. The guidance is static advice, not generated from your code.
 - **Downloads:** a Markdown report and a full JSON evidence export. Both include notices explaining what each label means. They contain no secrets and no AI-written content.
 
+## What phase 6 adds (AI Test Engineer)
+
+The AI Test Engineer helps you plan fault-injection tests from plain English, investigate failures using the stored execution trace, and identify untested scenarios across your stored verified events.
+
+### 1. Natural-language test planning
+
+Enter a plain-English request such as:
+
+> `"Test whether my application processes the same completed payment webhook twice."`
+
+Faultline converts the request into a **validated structured test specification** containing:
+
+- **Test objective**
+- **Required source event** (matched against your project's stored PayPal-verified events, or noting if none is stored yet)
+- **Fault scenario and parameters** (`forward`, `duplicate`, `delay`, `drop`, or `replay`)
+- **Planned delivery attempts**
+- **Expected behavior**
+- **Deterministic assertions** (mapped directly to the checks in `src/checks.js`)
+- **Potential failure conditions**
+
+Every generated specification is validated before it is saved and validated again before it is executed. Executing a plan requires a genuine PayPal-verified webhook event stored in the project and runs through Faultline's standard fault-injection forwarder.
+
+### 2. Evidence-based failure analysis
+
+After a scenario run completes (or fails), select **Analyze with AI Test Engineer** on the run or in the **AI Test Engineer** panel. The analysis receives only the stored execution trace (delivery attempts, HTTP status codes, timings, response snippets, before/after state probe snapshots, PayPal order snapshots, and deterministic check results) and explains:
+
+- **What happened**
+- **What was expected**
+- **What actually happened** (for example, when an endpoint answers HTTP 500 on the first delivery and HTTP 200 on the retry, or when `event.processed_count` rises to 3 across 3 duplicate deliveries)
+- **Where the failure occurred**
+- **Why it matters**
+- **What to investigate**
+- **Concrete remediation recommendation**
+
+Every analysis separates **Directly observed facts**, **Assumptions and blind spots**, and **Recommendations**, and flags **Insufficient evidence** whenever no state probe is configured or required probe fields are missing.
+
+### 3. Evidence-based test suggestions
+
+Based on your project's stored verified events, previous scenario runs, and failed or unevaluated checks, the AI Test Engineer recommends specific next tests (for example, running concurrent duplicates after sequential duplicates pass, replaying an event after a failed delivery, or delaying an older `CHECKOUT.ORDER.APPROVED` event after a newer `PAYMENT.CAPTURE.COMPLETED` event to test stale-overwrite protection). If no verified events exist yet, it says so instead of inventing generic advice.
+
+### Strict AI rules enforced in code
+
+- **Cannot fabricate PayPal events:** plans can only run against events with `verification_status = 'verified'`.
+- **Cannot execute financial operations:** requests to create orders, capture payments, or issue refunds are refused (`422 unsafe_request`), and test plans set `financialOperationsAllowed: false`.
+- **Cannot invent results or override checks:** `scenario_runs.verdict` and `assertion_results` are written only by `src/checks.js`. `enforceAnalysisGuardrails` locks the deterministic verdict (`canOverride: false`), observations, and insufficient-evidence flags to the ground-truth trace.
+- **Cannot access or reveal secrets:** `paypal_secret_enc`, decrypted secrets, OAuth tokens, `ENCRYPTION_KEY`, and `SESSION_SECRET` are never passed to or readable by the AI module.
+
 ## Requirements
 
 - Windows with Command Prompt (CMD)
@@ -224,7 +269,7 @@ How to set up the scenarios for the harder checks:
 
 ## Set up (Windows CMD)
 
-```
+```cmd
 cd path\to\faultline
 npm install
 npm run setup
@@ -237,9 +282,30 @@ Open http://127.0.0.1:3000 and sign in.
 
 To run the automated tests:
 
-```
+```cmd
 npm test
 ```
+
+## Local demonstration path (Windows CMD)
+
+If you do not yet have your own application running, Faultline includes a local sample receiver and state probe (`scripts/demo-receiver.js`) so you can test both a failing (non-idempotent) handler and a passing (idempotent) handler against real PayPal Sandbox webhooks:
+
+1. Start Faultline in one Command Prompt window:
+   ```cmd
+   npm start
+   ```
+2. In a second Command Prompt window, start the local sample receiver in **buggy** mode (processes every duplicate webhook and allows stale overwrites):
+   ```cmd
+   node scripts\demo-receiver.js buggy
+   ```
+   It listens on `http://127.0.0.1:4000` with:
+   - Webhook endpoint URL: `http://127.0.0.1:4000/webhooks/paypal`
+   - State probe URL: `http://127.0.0.1:4000/faultline-probe`
+3. Create a project in Faultline using your PayPal Sandbox Client ID and Secret, webhook endpoint `http://127.0.0.1:4000/webhooks/paypal`, and state probe URL `http://127.0.0.1:4000/faultline-probe`.
+4. Register your project's Receiver URL in the PayPal Developer Dashboard (via an HTTPS tunnel such as `ngrok http 3000`), save the **PayPal Webhook ID**, and create, approve, and capture a Sandbox order.
+5. In the **AI Test Engineer** panel, generate a plan for `"Test whether my application processes the same completed payment webhook twice"` and select **Execute validated test plan** on the verified `PAYMENT.CAPTURE.COMPLETED` event.
+6. Observe that the run verdict is **Failed** (`event.processed_count` and `payment.payment_records` both rose to 2), and select **Analyze with AI Test Engineer** to inspect the evidence-based failure explanation.
+7. Restart the sample receiver in **idempotent** mode (`Ctrl+C`, then `node scripts\demo-receiver.js idempotent`), run the scenario again, and observe that all application-state checks **Pass**.
 
 ## Get PayPal Sandbox credentials
 
@@ -271,23 +337,21 @@ Live credentials will be rejected by the Sandbox. That is expected.
 
 ## What was verified
 
-Run in a Linux container, Node 22:
-
-- **119 automated tests pass** (`npm test`). Phase 5 adds pure unit tests for every check (synthetic evidence, no network), and end-to-end tests against a stand-in application with switchable behavior: a correctly idempotent handler passes, and each planted bug is caught (processes every copy, commits then answers 500, overwrites newer state, accepts over-refunds). Other tests cover probe failures (down, not JSON, wrong format, missing field, unreachable), a missing probe giving "inconclusive", the verdict rules, overview numbers matching stored rows, findings, and report exports.
-- Protections were checked by deliberately breaking them (earlier phases: capture lock, byte-exact bodies, the "verified" label, drop, idempotent scenario creation; this phase: the idempotency comparison, the rule that only application-state evidence can make a run "passed", and taking the after-snapshot). The tests failed each time.
-- The UI was driven in headless Chromium: probe setup and test, a buggy application failing with evidence, a correct one passing, a run without a probe reported as inconclusive, history filtering, and a real Markdown report download with no secrets in it.
-- The unzipped package installs from scratch with `npm install` and the full suite passes.
-- The unmodified server, pointed at the real Sandbox address, reported **PayPal unreachable** (the container has no route to PayPal) and did not mark anything connected.
+- **131 automated tests pass** (`npm test`).
+  - Phase 6 adds pure unit tests (`test/ai-engineer.test.js`) and integration tests (`test/ai-integration.test.js`) covering natural-language test planning, specification validation, refusal of forbidden requests (executing financial operations, fabricating events, overriding verdicts, revealing secrets), evidence-based failure analysis (including mixed HTTP 500 then 200 retry sequences, commit-before-500 transaction leaks, and missing-probe insufficient-evidence flags), guardrail enforcement locking deterministic verdicts, and integration-specific test suggestions.
+  - Phase 5 adds pure unit tests for every check (`test/checks.test.js`) and end-to-end tests (`test/checks-integration.test.js`, `test/reports.test.js`) against a stand-in application with switchable behavior: a correctly idempotent handler passes, and each planted bug is caught (processes every copy, commits then answers 500, overwrites newer state, accepts over-refunds).
+  - Earlier phases (`test/api.test.js`, `test/paypal.test.js`, `test/orders.test.js`, `test/webhooks.test.js`, `test/scenarios.test.js`, `test/crypto.test.js`, `test/config.test.js`, `test/db.test.js`) verify project credential encryption, PayPal Sandbox OAuth/Orders/Captures/Webhook signature verification, byte-exact webhook forwarding, fault injection, and database migrations.
+- Protections were checked by deliberately breaking them (capture lock, byte-exact bodies, the "verified" label, drop, idempotent scenario creation, idempotency comparison, the rule that only application-state evidence can make a run "passed", taking the after-snapshot, and AI guardrails preventing verdict overrides).
 
 ## What was NOT verified
 
-- **No request has reached the real PayPal Sandbox, and no real PayPal webhook has reached Faultline.** Tests labeled `[fixture]` use local stand-ins for PayPal and for your application, and made-up event bodies. They test Faultline's behavior, not PayPal's or your application's. A real PayPal signature has never been verified by this code, and no real application or real probe has been tested.
+- **No request in the automated test suite has reached the real PayPal Sandbox, and no real PayPal webhook has reached Faultline during automated tests.** Tests labeled `[fixture]` use local stand-ins for PayPal and for your application, and made-up event bodies. They test Faultline's behavior, not PayPal's or your application's. Connecting to the live PayPal Sandbox requires your own PayPal Sandbox Client ID, Secret, and Webhook ID.
 - The refund check reads Payment capture refunded events as PayPal documents them (the `up` link to the capture and the refund amount). That shape has not been checked against a real Sandbox refund event. Faultline does not issue refunds itself.
 - Probe results are only as good as your probe. If it reports wrong state, the checks will judge wrong state.
 - Request shapes for PayPal were written from PayPal's published reference. Watch on your first real run: PayPal might not accept an `http://127.0.0.1` return URL for order approval (use your tunnel address as `PUBLIC_BASE_URL`), and the Sandbox app needs the Checkout feature (the default Sandbox app has it).
 - The buyer approval step is a human step on PayPal's website. No test automates it.
 
-Your first real checks, in order: project shows **Connected**; **Create Sandbox order** returns an approval link; after approving as a buyer, **Refresh** shows **Approved**; **Capture** shows **Completed**; the webhook registered with PayPal shows **Verified by PayPal** events; **Forward once** reaches your application; and **Test probe** shows your application's state. Whatever differs, the screen shows the real response.
+Your first real checks, in order: project shows **Connected**; **Create Sandbox order** returns an approval link; after approving as a buyer, **Refresh** shows **Approved**; **Capture** shows **Completed**; the webhook registered with PayPal shows **Verified by PayPal** events; **Forward once** reaches your application; **Test probe** shows your application's state; and **AI Test Engineer** plans a test and analyzes the completed run. Whatever differs, the screen shows the real response.
 
 ## Security notes
 
@@ -306,9 +370,9 @@ Your first real checks, in order: project shows **Connected**; **Create Sandbox 
 ## Layout
 
 ```
-src/      server, API, orders, webhooks, forwarder, scenarios, checks, probe, evidence, reports, PayPal client and shared PayPal service, crypto, database
+src/      server, API, orders, webhooks, forwarder, scenarios, checks, probe, evidence, reports, AI test engineer (ai.js, ai-engineer.js), PayPal client and shared PayPal service, crypto, database
 public/   the UI (plain HTML, CSS, JavaScript; no build step)
 test/     automated tests
-support/  test fixtures (local stand-in for PayPal, tests only)
-scripts/  setup-env.js
+support/  test fixtures (local stand-in for PayPal and target app, tests only)
+scripts/  setup-env.js, demo-receiver.js
 ```

@@ -32,6 +32,9 @@
     runs: [], runDetail: null, runError: null, scenarioKey: null,
     overview: null, findings: [], runFilter: '', probeResult: null, probeError: null,
     scenarioForm: { kind: 'forward', count: '3', mode: 'sequential', delaySeconds: '10' },
+    aiPrompt: 'Test whether my application processes the same completed payment webhook twice.',
+    aiPlans: [], aiSelectedPlan: null, aiPlanEventId: '', aiPlanError: null,
+    aiAnalysis: null, aiAnalysisRunId: '', aiAnalysisError: null, aiSuggestions: null,
   };
   let pollTimer = null;
 
@@ -191,6 +194,8 @@
         state.orderDetail = null; state.orderError = null; state.orderKey = newKey();
         state.eventDetail = null; state.eventError = null; state.webhookError = null; state.eventFilters = { status: '', type: '', q: '' };
         state.runDetail = null; state.runError = null; state.scenarioKey = newKey();
+        state.aiPlans = []; state.aiSelectedPlan = null; state.aiPlanEventId = ''; state.aiPlanError = null;
+        state.aiAnalysis = null; state.aiAnalysisRunId = ''; state.aiAnalysisError = null; state.aiSuggestions = null;
       }
       state.orderProjectId = id;
       await loadOrderData(id);
@@ -231,7 +236,7 @@
       name: field({ id: 'name', label: 'Project name', hint: 'For example, Checkout service (staging).' }),
       clientId: field({ id: 'clientId', label: 'Sandbox Client ID' }),
       clientSecret: field({ id: 'clientSecret', label: 'Sandbox Secret', type: 'password', autocomplete: 'new-password', hint: 'Sent once over this connection, stored encrypted, and never shown again.' }),
-      url: field({ id: 'webhookEndpointUrl', label: 'Your webhook endpoint URL', hint: 'The URL in your own application that receives PayPal webhooks, such as http://localhost:4000/webhooks/paypal. It is saved now; forwarding to it is added in a later phase.' }),
+      url: field({ id: 'webhookEndpointUrl', label: 'Your webhook endpoint URL', hint: 'The URL in your own application that receives PayPal webhooks, such as http://localhost:4000/webhooks/paypal.' }),
     };
     const err = h('div', { role: 'alert' });
     const submit = h('button', { class: 'btn primary', type: 'submit' }, 'Create and check connection');
@@ -555,16 +560,21 @@
     if (f.status) qs.set('status', f.status);
     if (f.type) qs.set('type', f.type);
     if (f.q.trim()) qs.set('q', f.q.trim());
-    const [e, d, c, r, o, fnd] = await Promise.all([
+    const [e, d, c, r, o, fnd, plans, sug] = await Promise.all([
       api('GET', `/api/projects/${projectId}/events?${qs}`),
       api('GET', `/api/projects/${projectId}/webhook-deliveries`),
       api('GET', `/api/projects/${projectId}/paypal-calls`),
       api('GET', `/api/projects/${projectId}/scenario-runs`),
       api('GET', `/api/projects/${projectId}/overview`),
       api('GET', `/api/projects/${projectId}/findings`),
+      api('GET', `/api/projects/${projectId}/ai/plans`),
+      api('GET', `/api/projects/${projectId}/ai/suggestions`),
     ]);
     state.overview = o; state.findings = fnd.findings;
     state.events = e.events; state.eventTotal = e.total; state.eventTypes = e.eventTypes; state.deliveries = d.deliveries; state.calls = c.calls; state.runs = r.runs;
+    state.aiPlans = plans.plans; state.aiSuggestions = sug;
+    if (state.aiSelectedPlan) state.aiSelectedPlan = state.aiPlans.find((x) => x.id === state.aiSelectedPlan.id) || state.aiPlans[0] || null;
+    else if (state.aiPlans.length) state.aiSelectedPlan = state.aiPlans[0];
   }
 
   async function eventAction(p, btn, busyText, fn) {
@@ -660,6 +670,7 @@
     if (state.eventDetail) parts.push(eventDetailPanel(p));
     parts.push(runsPanel(p));
     if (state.runDetail) parts.push(runDetailPanel(p));
+    parts.push(aiEngineerPanel(p));
     parts.push(reportsPanel(p));
     parts.push(deliveriesPanel());
     return parts;
@@ -859,7 +870,7 @@
       [['', 'All verdicts'], ['passed', 'Passed'], ['failed', 'Failed'], ['inconclusive', 'Inconclusive']].map(([v, l]) => h('option', { value: v, selected: v === state.runFilter }, l)));
     const rows = shown.map((r) => h('tr', { class: state.runDetail && state.runDetail.run.id === r.id ? 'selected' : null },
       h('td', null, fmtTime(r.createdAt)),
-      h('td', null, r.label, r.triggeredBy === 'auto' ? ' (automatic)' : ''),
+      h('td', null, r.label, r.triggeredBy === 'auto' ? ' (automatic)' : r.triggeredBy === 'ai_plan' ? ' (from AI plan)' : ''),
       h('td', { class: 'mono' }, r.paypalEventId || '\u2014'),
       h('td', null, runBadge(r.status)),
       h('td', null, verdictBadge(r.verdict)),
@@ -882,7 +893,7 @@
   }
 
   function runDetailPanel(p) {
-    const { run, attempts, result } = state.runDetail;
+    const { run, attempts, result, aiAnalysis } = state.runDetail;
     const cancel = run.status === 'scheduled' ? h('button', { class: 'btn danger', type: 'button', onclick: async () => {
       try {
         await api('POST', `/api/projects/${p.id}/scenario-runs/${run.id}/cancel`);
@@ -891,6 +902,21 @@
       } catch (ex) { state.runError = ex; }
       renderMain();
     } }, 'Cancel') : null;
+    const canAnalyze = ['completed', 'failed', 'cancelled'].includes(run.status);
+    const analyzeBtn = canAnalyze ? h('button', { class: 'btn primary', type: 'button', onclick: async () => {
+      analyzeBtn.disabled = true; analyzeBtn.textContent = 'Analyzing evidence\u2026';
+      state.aiAnalysisError = null;
+      try {
+        const data = await api('POST', `/api/projects/${p.id}/scenario-runs/${run.id}/analyze`);
+        state.aiAnalysis = data.analysis;
+        state.aiAnalysisRunId = run.id;
+        state.runDetail = await api('GET', `/api/projects/${p.id}/scenario-runs/${run.id}`);
+      } catch (ex) {
+        if (ex.status === 401) return showLogin('Your session ended. Sign in again.');
+        state.aiAnalysisError = ex;
+      }
+      renderMain();
+    } }, aiAnalysis ? 'Re-analyze evidence' : 'Analyze with AI Test Engineer') : null;
     const secs = (ms) => (ms === null || ms === undefined ? '\u2014' : `${(ms / 1000).toFixed(1)} s`);
     const attemptRows = attempts.map((a) => h('tr', null,
       h('td', null, `${a.attemptNo} of ${run.plannedAttempts}`),
@@ -902,7 +928,7 @@
       h('td', { class: 'mono wrap' }, a.responseSnippet ? a.responseSnippet.slice(0, 200) : (a.errorText || '\u2014'))));
     const sample = attempts.find((a) => Object.keys(a.requestHeaders).length);
     return h('section', { class: 'panel' },
-      h('div', { class: 'title-row' }, h('h2', { class: 'section nomargin' }, result.scenarioLabel), runBadge(run.status), h('div', { class: 'actions' }, cancel)),
+      h('div', { class: 'title-row' }, h('h2', { class: 'section nomargin' }, result.scenarioLabel), runBadge(run.status), h('div', { class: 'actions' }, analyzeBtn, cancel)),
       state.runError ? errorBox(state.runError) : null,
       result.dropped ? h('div', { class: 'alert idle', role: 'status' }, h('strong', null, 'Deliberately dropped.'), h('p', { class: 'alert-text' }, 'Faultline held this event back on purpose. Your endpoint received nothing from this run.')) : null,
       run.status === 'scheduled' ? h('div', { class: 'alert warn', role: 'status' }, h('strong', null, 'Waiting to send.'), h('p', { class: 'alert-text' }, `Scheduled for ${fmtTime(run.scheduledFor)}. If Faultline restarts first, the run is picked up again.`)) : null,
@@ -928,6 +954,7 @@
       assertionsTable(state.runDetail),
       snapshotsTable(state.runDetail),
       result.risks && result.risks.length ? h('div', { class: 'alert idle', role: 'status' }, h('strong', null, 'Inferred risks (suspicions, not verdicts)'), h('ul', null, result.risks.map((x) => h('li', null, x)))) : null,
+      aiAnalysis ? aiAnalysisView(aiAnalysis) : null,
       h('h2', { class: 'section spaced' }, 'Delivery attempts'),
       h('div', { class: 'table-wrap' }, h('table', { class: 'checks' },
         h('thead', null, h('tr', null, ['Attempt', 'Kind', 'Sent at', 'Outcome', 'HTTP', 'Took', 'Reply or error'].map((t) => h('th', { scope: 'col' }, t)))),
@@ -1090,6 +1117,231 @@ app.get('/faultline-probe', async (req, res) => {
         : h('div', { class: 'table-wrap' }, h('table', { class: 'checks' },
           h('thead', null, h('tr', null, ['Finding', 'Status', 'General guidance (not generated from your code)', ''].map((t) => h('th', { scope: 'col' }, t)))),
           h('tbody', null, rows))));
+  }
+
+  // ---- phase 6: AI test engineer -----------------------------------------
+  const EXAMPLE_PROMPTS = [
+    ['Duplicate x2', 'Test whether my application processes the same completed payment webhook twice.'],
+    ['Concurrent x3', 'Send 3 concurrent duplicate deliveries of the completed payment webhook at the same time.'],
+    ['Delayed 10s', 'Hold the order approved webhook and deliver it after 10 seconds to test stale overwrite protection.'],
+    ['Dropped', 'Drop the completed payment webhook to verify the payment state stays valid when a notification is lost.'],
+    ['Replay', 'Replay the previously received completed payment webhook to check idempotency.'],
+  ];
+
+  function aiAnalysisView(a) {
+    const dv = a.deterministicVerdict || {};
+    const vCls = dv.status === 'passed' ? 'ok' : dv.status === 'failed' ? 'bad' : 'warn';
+    const vLabel = (VERDICT[dv.status] || [0, dv.status || 'Not evaluated'])[1];
+    return h('div', { class: 'ai-analysis' },
+      h('h2', { class: 'section spaced' }, 'AI Test Engineer failure analysis'),
+      h('div', { class: `alert ${vCls}`, role: 'status' },
+        h('strong', null, `Deterministic verdict: ${vLabel} (locked)`),
+        h('p', { class: 'alert-text' }, dv.notice || 'This verdict comes solely from Faultline\u2019s deterministic checks. The AI Test Engineer cannot alter or override it.')),
+      a.insufficientEvidence ? h('div', { class: 'alert warn', role: 'status' },
+        h('strong', null, 'Insufficient evidence to confirm internal state'),
+        h('p', { class: 'alert-text' }, a.insufficientReason || 'Some application-state checks could not be evaluated from the available trace.')) : null,
+      h('dl', { class: 'facts' },
+        h('dt', null, 'What happened'), h('dd', null, a.whatHappened),
+        h('dt', null, 'What was expected'), h('dd', null, a.whatWasExpected),
+        h('dt', null, 'What actually happened'), h('dd', null, a.whatActuallyHappened),
+        h('dt', null, 'Where failure occurred'), h('dd', null, a.whereFailureOccurred),
+        h('dt', null, 'Why it matters'), h('dd', null, a.whyItMatters),
+        h('dt', null, 'What to investigate'), h('dd', null, a.whatToInvestigate),
+        h('dt', null, 'Remediation'), h('dd', null, a.remediation)),
+      h('h3', { class: 'subsection spaced' }, 'Directly observed facts (from execution trace)'),
+      h('ul', { class: 'plain' }, (a.observations || []).map((x) => h('li', null, h('span', { class: 'tag' }, 'Observed'), ' ', x))),
+      h('h3', { class: 'subsection spaced' }, 'Assumptions and blind spots'),
+      h('ul', { class: 'plain' }, (a.assumptions || []).map((x) => h('li', null, h('span', { class: 'tag' }, 'Assumption'), ' ', x))),
+      h('h3', { class: 'subsection spaced' }, 'Concrete recommendations'),
+      h('ul', { class: 'plain' }, (a.recommendations || []).map((x) => h('li', null, h('span', { class: 'tag' }, 'Recommendation'), ' ', x))));
+  }
+
+  function renderPlanSpec(p, plan) {
+    const spec = plan.spec;
+    const verifiedEvents = state.events.filter((e) => e.verification.status === 'verified');
+    const selectedEvId = state.aiPlanEventId || plan.matchedEventId || (verifiedEvents[0] ? verifiedEvents[0].id : '');
+    const evSelect = verifiedEvents.length
+      ? h('select', { id: 'aiPlanEvent', 'aria-label': 'Verified source event', onchange: (e) => { state.aiPlanEventId = e.target.value; } },
+        verifiedEvents.map((e) => h('option', { value: e.id, selected: e.id === selectedEvId }, `${e.eventType || 'Event'} (${e.paypalEventId || e.id.slice(0, 8)})`)))
+      : null;
+
+    const runBtn = h('button', {
+      class: 'btn primary',
+      type: 'button',
+      disabled: !verifiedEvents.length || plan.validationStatus !== 'valid',
+      title: verifiedEvents.length ? '' : 'Receive a PayPal-verified webhook event in this project before executing this test plan.',
+      onclick: async () => {
+        runBtn.disabled = true; runBtn.textContent = 'Starting scenario\u2026';
+        state.aiPlanError = null;
+        try {
+          const evId = evSelect ? evSelect.value : plan.matchedEventId;
+          const data = await api('POST', `/api/projects/${p.id}/ai/plans/${plan.id}/execute`, { eventId: evId, idempotencyKey: newKey() });
+          state.aiSelectedPlan = data.plan;
+          state.runDetail = await api('GET', `/api/projects/${p.id}/scenario-runs/${data.run.id}`);
+          await loadEventData(p.id);
+        } catch (ex) {
+          if (ex.status === 401) return showLogin('Your session ended. Sign in again.');
+          state.aiPlanError = ex;
+        }
+        renderMain();
+      },
+    }, 'Execute validated test plan');
+
+    const assertionRows = (spec.assertions || []).map((a) => h('tr', null,
+      h('td', null, h('strong', null, a.name), h('div', { class: 'hint block' }, CATEGORY[a.category] || a.category)),
+      h('td', null, a.requiresProbe ? h('span', { class: 'badge warn' }, 'Requires state probe') : h('span', { class: 'badge ok' }, 'Observed / PayPal')),
+      h('td', { class: 'wrap' }, a.criterion || '\u2014')));
+
+    const paramSummary = spec.scenario.kind === 'duplicate'
+      ? `${spec.scenario.params.count} deliveries (${spec.scenario.params.mode})`
+      : spec.scenario.kind === 'delay'
+        ? `Hold for ${spec.scenario.params.delaySeconds} second(s)`
+        : spec.scenario.kind === 'drop'
+          ? 'Withhold event (0 requests sent)'
+          : '1 delivery';
+
+    return h('div', { class: 'spec-box' },
+      h('div', { class: 'title-row' },
+        h('h3', { class: 'subsection nomargin' }, 'Structured test specification'),
+        plan.validationStatus === 'valid' ? h('span', { class: 'badge ok' }, 'Validated specification') : h('span', { class: 'badge bad' }, 'Invalid specification'),
+        plan.executedRunId ? h('span', { class: 'badge idle' }, 'Executed') : null),
+      h('dl', { class: 'facts' },
+        h('dt', null, 'Plain-English request'), h('dd', null, plan.prompt),
+        h('dt', null, 'Test objective'), h('dd', null, spec.objective),
+        h('dt', null, 'Required source event'), h('dd', null, h('span', { class: 'mono' }, spec.requiredSourceEvent.eventType), ' \u2014 ', spec.requiredSourceEvent.availabilityNote),
+        h('dt', null, 'Fault scenario'), h('dd', null, `${spec.scenario.label} (${paramSummary})`),
+        h('dt', null, 'Delivery attempts'), h('dd', null, `${spec.plannedAttempts} planned (${spec.requestsToSend} HTTP request(s) to send)`),
+        h('dt', null, 'Expected behavior'), h('dd', null, spec.expectedBehavior),
+        h('dt', null, 'Safety boundary'), h('dd', null, spec.safetyNotice)),
+      h('h3', { class: 'subsection spaced' }, 'Deterministic assertions'),
+      h('div', { class: 'table-wrap' }, h('table', { class: 'checks' },
+        h('thead', null, h('tr', null, ['Deterministic check', 'Evidence source', 'Pass criterion'].map((t) => h('th', { scope: 'col' }, t)))),
+        h('tbody', null, assertionRows))),
+      h('h3', { class: 'subsection spaced' }, 'Potential failure conditions'),
+      h('ul', { class: 'plain' }, (spec.failureConditions || []).map((c) => h('li', null, c))),
+      h('div', { class: 'row-form spaced-top' },
+        evSelect ? h('label', { class: 'field grow', for: 'aiPlanEvent' }, h('span', { class: 'label' }, 'Run against verified event'), evSelect) : h('p', { class: 'empty' }, 'No PayPal-verified events are stored yet. Receive a verified webhook from PayPal Sandbox first.'),
+        h('div', { class: 'field' }, h('span', { class: 'label' }, '\u00A0'), runBtn)));
+  }
+
+  function aiEngineerPanel(p) {
+    const promptInput = h('input', {
+      id: 'aiPrompt',
+      type: 'text',
+      value: state.aiPrompt,
+      placeholder: 'For example: Test whether my application processes the same completed payment webhook twice.',
+      autocomplete: 'off',
+      oninput: (e) => { state.aiPrompt = e.target.value; },
+    });
+    const planBtn = h('button', { class: 'btn primary', type: 'submit' }, 'Generate test plan');
+    const planForm = h('form', { class: 'row-form', novalidate: true, onsubmit: async (e) => {
+      e.preventDefault();
+      planBtn.disabled = true; planBtn.textContent = 'Planning\u2026';
+      state.aiPlanError = null;
+      try {
+        const data = await api('POST', `/api/projects/${p.id}/ai/plans`, { prompt: state.aiPrompt });
+        state.aiSelectedPlan = data.plan;
+        state.aiPlanEventId = data.plan.matchedEventId || '';
+        await loadEventData(p.id);
+      } catch (ex) {
+        if (ex.status === 401) return showLogin('Your session ended. Sign in again.');
+        state.aiPlanError = ex;
+      }
+      renderMain();
+    } },
+    h('label', { class: 'field grow', for: 'aiPrompt' }, h('span', { class: 'label' }, 'Describe a reliability test in plain English'), promptInput),
+    h('div', { class: 'field' }, h('span', { class: 'label' }, '\u00A0'), planBtn));
+
+    const quickBtns = h('div', { class: 'quick-prompts' },
+      h('span', { class: 'hint' }, 'Examples: '),
+      ...EXAMPLE_PROMPTS.map(([label, text]) => h('button', {
+        class: 'btn small',
+        type: 'button',
+        onclick: () => { state.aiPrompt = text; renderMain(); },
+      }, label)));
+
+    // Failure analysis section for any completed/failed run
+    const finishedRuns = state.runs.filter((r) => ['completed', 'failed', 'cancelled'].includes(r.status));
+    const currentRunId = state.aiAnalysisRunId || (state.runDetail ? state.runDetail.run.id : (finishedRuns[0] ? finishedRuns[0].id : ''));
+    const activeAnalysis = (state.runDetail && state.runDetail.aiAnalysis && state.runDetail.run.id === currentRunId)
+      ? state.runDetail.aiAnalysis
+      : (state.aiAnalysis && state.aiAnalysis.runId === currentRunId ? state.aiAnalysis : null);
+
+    const runSelect = finishedRuns.length
+      ? h('select', { id: 'aiAnalyzeRunSelect', 'aria-label': 'Finished scenario run to analyze', onchange: (e) => { state.aiAnalysisRunId = e.target.value; renderMain(); } },
+        finishedRuns.map((r) => h('option', { value: r.id, selected: r.id === currentRunId }, `${r.label} on ${r.paypalEventId || r.eventType || 'event'} \u2014 ${r.verdict || r.status} (${fmtTime(r.createdAt)})`)))
+      : null;
+
+    const analyzeRunBtn = finishedRuns.length ? h('button', {
+      class: 'btn primary',
+      type: 'button',
+      onclick: async () => {
+        const targetId = runSelect ? runSelect.value : currentRunId;
+        if (!targetId) return;
+        analyzeRunBtn.disabled = true; analyzeRunBtn.textContent = 'Analyzing trace\u2026';
+        state.aiAnalysisError = null;
+        try {
+          const data = await api('POST', `/api/projects/${p.id}/scenario-runs/${targetId}/analyze`);
+          state.aiAnalysis = data.analysis;
+          state.aiAnalysisRunId = targetId;
+          if (state.runDetail && state.runDetail.run.id === targetId) {
+            state.runDetail = await api('GET', `/api/projects/${p.id}/scenario-runs/${targetId}`);
+          }
+        } catch (ex) {
+          if (ex.status === 401) return showLogin('Your session ended. Sign in again.');
+          state.aiAnalysisError = ex;
+        }
+        renderMain();
+      },
+    }, 'Explain run from evidence') : null;
+
+    // Suggestions section
+    const sug = state.aiSuggestions;
+    const suggestionRows = (sug && sug.suggestions ? sug.suggestions : []).map((s) => h('tr', null,
+      h('td', null, h('strong', null, s.title), h('div', { class: 'hint block mono' }, `${s.eventType} \u00B7 ${s.paypalEventId || s.eventId}`)),
+      h('td', null, h('span', { class: `badge ${s.priority === 'high' ? 'bad' : s.priority === 'medium' ? 'warn' : 'idle'}` }, pretty(s.priority))),
+      h('td', { class: 'wrap' }, s.rationale,
+        s.basedOn && s.basedOn.length ? h('ul', { class: 'plain evidence' }, s.basedOn.map((b) => h('li', null, h('span', { class: 'tag' }, 'Evidence'), ' ', b))) : null),
+      h('td', null, (() => {
+        const b = h('button', { class: 'btn', type: 'button', onclick: async () => {
+          b.disabled = true; b.textContent = 'Running\u2026';
+          state.aiPlanError = null;
+          try {
+            const body = { kind: s.scenario.kind, ...(s.scenario.params || {}), idempotencyKey: newKey() };
+            const data = await api('POST', `/api/projects/${p.id}/events/${s.eventId}/scenarios`, body);
+            state.runDetail = await api('GET', `/api/projects/${p.id}/scenario-runs/${data.run.id}`);
+            await loadEventData(p.id);
+          } catch (ex) {
+            if (ex.status === 401) return showLogin('Your session ended. Sign in again.');
+            state.aiPlanError = ex;
+          }
+          renderMain();
+        } }, 'Run test');
+        return b;
+      })())));
+
+    return h('section', { class: 'panel' },
+      h('h2', { class: 'section' }, 'AI Test Engineer'),
+      h('p', { class: 'hint-text' }, 'Plans structured webhook reliability tests from plain English, explains failures using only stored execution traces, and recommends next tests from observed evidence. It cannot fabricate events, invent passing results, access PayPal secrets, or override deterministic checks.'),
+      planForm,
+      quickBtns,
+      state.aiPlanError ? errorBox(state.aiPlanError) : null,
+      state.aiSelectedPlan ? renderPlanSpec(p, state.aiSelectedPlan) : null,
+      h('h2', { class: 'section spaced' }, 'Evidence-based failure analysis'),
+      finishedRuns.length === 0
+        ? h('p', { class: 'empty' }, 'No finished scenario runs yet. Run a scenario above, then ask the AI Test Engineer to explain the execution trace.')
+        : h('div', { class: 'row-form' },
+          h('label', { class: 'field grow', for: 'aiAnalyzeRunSelect' }, h('span', { class: 'label' }, 'Select a completed or failed scenario run'), runSelect),
+          h('div', { class: 'field' }, h('span', { class: 'label' }, '\u00A0'), analyzeRunBtn)),
+      state.aiAnalysisError ? errorBox(state.aiAnalysisError) : null,
+      activeAnalysis ? aiAnalysisView(activeAnalysis) : null,
+      h('h2', { class: 'section spaced' }, 'Recommended additional tests (from stored evidence)'),
+      sug ? h('p', { class: 'hint-text' }, sug.summary) : null,
+      !sug || sug.insufficientEvidence || !sug.suggestions.length
+        ? h('p', { class: 'empty' }, sug && sug.insufficientEvidence ? 'Receive at least one PayPal-verified webhook event to unlock integration-specific test recommendations.' : 'All standard fault scenarios have been exercised on the currently stored verified events.')
+        : h('div', { class: 'table-wrap' }, h('table', { class: 'checks' },
+          h('thead', null, h('tr', null, ['Recommended test', 'Priority', 'Why it matters (based on stored evidence)', ''].map((t) => h('th', { scope: 'col' }, t)))),
+          h('tbody', null, suggestionRows))));
   }
 
   // ---- start ------------------------------------------------------------
