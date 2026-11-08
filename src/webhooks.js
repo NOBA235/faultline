@@ -224,9 +224,37 @@ function registerWebhookRoutes({ app, db, paypal, service, config, requireAuth, 
     let payload = null;
     try { payload = JSON.parse(rawText); } catch { payload = null; }
     const deliveries = db.prepare('SELECT * FROM webhook_deliveries WHERE event_id = ? ORDER BY id').all(e.id).map(publicDelivery);
-    const runs = db.prepare('SELECT id, kind, status, verdict, planned_attempts, created_at FROM scenario_runs WHERE event_id = ? ORDER BY created_at DESC, rowid DESC').all(e.id)
-      .map((r) => ({ id: r.id, kind: r.kind, status: r.status, verdict: r.verdict, plannedAttempts: r.planned_attempts, createdAt: r.created_at }));
-    return { event: publicEvent(e), headers: JSON.parse(e.headers_json), payload, rawText, rawBytes: e.raw_body.length, deliveries, runs };
+    const runs = db.prepare('SELECT id, kind, triggered_by, destination_url, status, verdict, planned_attempts, created_at, started_at, finished_at FROM scenario_runs WHERE event_id = ? ORDER BY created_at DESC, rowid DESC').all(e.id)
+      .map((r) => {
+        const atts = db.prepare('SELECT attempt_no, delivery_kind, sent_at, duration_ms, outcome, http_status FROM forward_attempts WHERE run_id = ? ORDER BY attempt_no').all(r.id);
+        const sent = atts.filter((a) => !['dropped', 'blocked'].includes(a.outcome));
+        return {
+          id: r.id,
+          kind: r.kind,
+          label: forwarder ? forwarder.LABELS[r.kind] : r.kind,
+          triggeredBy: r.triggered_by,
+          destination: r.destination_url,
+          status: r.status,
+          verdict: r.verdict,
+          plannedAttempts: r.planned_attempts,
+          requestsSent: sent.length,
+          statusCodes: sent.map((a) => a.http_status),
+          dropped: atts.some((a) => a.outcome === 'dropped'),
+          createdAt: r.created_at,
+          startedAt: r.started_at,
+          finishedAt: r.finished_at,
+          attempts: atts.map((a) => ({
+            attemptNo: a.attempt_no,
+            deliveryKind: a.delivery_kind,
+            sentAt: a.sent_at,
+            durationMs: a.duration_ms,
+            outcome: a.outcome,
+            httpStatus: a.http_status,
+          })),
+        };
+      });
+    const rawSha256 = crypto.createHash('sha256').update(e.raw_body).digest('hex');
+    return { event: publicEvent(e), headers: JSON.parse(e.headers_json), payload, rawText, rawBytes: e.raw_body.length, rawSha256, deliveries, runs };
   }
 
   const publicDelivery = (d) => ({

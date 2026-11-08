@@ -21,9 +21,28 @@ function registerReportRoutes({ app, db, forwarder, requireAuth, getProjectRow }
 
   app.get('/api/projects/:id/overview', requireAuth, (req, res) => {
     const p = getProjectRow(req.params.id);
-    const recent = db.prepare(`SELECT r.id, r.kind, r.status, r.verdict, r.created_at, e.paypal_event_id FROM scenario_runs r JOIN webhook_events e ON e.id = r.event_id
+    const recent = db.prepare(`SELECT r.id, r.kind, r.triggered_by, r.status, r.verdict, r.planned_attempts, r.created_at, e.paypal_event_id, e.event_type
+      FROM scenario_runs r JOIN webhook_events e ON e.id = r.event_id
       WHERE r.project_id = ? ORDER BY r.created_at DESC, r.rowid DESC LIMIT 5`).all(p.id)
-      .map((r) => ({ id: r.id, label: forwarder.LABELS[r.kind], status: r.status, verdict: r.verdict, createdAt: r.created_at, paypalEventId: r.paypal_event_id }));
+      .map((r) => {
+        const atts = db.prepare('SELECT outcome, http_status FROM forward_attempts WHERE run_id = ? ORDER BY attempt_no').all(r.id);
+        const sent = atts.filter((a) => !['dropped', 'blocked'].includes(a.outcome));
+        return {
+          id: r.id,
+          kind: r.kind,
+          label: forwarder.LABELS[r.kind],
+          triggeredBy: r.triggered_by,
+          status: r.status,
+          verdict: r.verdict,
+          plannedAttempts: r.planned_attempts,
+          requestsSent: sent.length,
+          statusCodes: sent.map((a) => a.http_status),
+          dropped: atts.some((a) => a.outcome === 'dropped'),
+          createdAt: r.created_at,
+          paypalEventId: r.paypal_event_id,
+          eventType: r.event_type,
+        };
+      });
     res.json({
       orders: { total: one('SELECT COUNT(*) AS n FROM paypal_orders WHERE project_id = ?', p.id).n, byStatus: grouped('SELECT status AS k, COUNT(*) AS n FROM paypal_orders WHERE project_id = ? GROUP BY status', p.id) },
       captures: { total: one('SELECT COUNT(*) AS n FROM paypal_captures WHERE project_id = ?', p.id).n },
@@ -37,6 +56,30 @@ function registerReportRoutes({ app, db, forwarder, requireAuth, getProjectRow }
       recentRuns: recent,
     });
   });
+
+  function failedAssertions(projectId) {
+    return db.prepare(`SELECT a.id, a.run_id, a.check_id, a.category, a.name, a.summary, a.evidence_json, a.evaluated_at,
+        r.kind, e.paypal_event_id, e.event_type
+      FROM assertion_results a
+      JOIN scenario_runs r ON r.id = a.run_id
+      JOIN webhook_events e ON e.id = r.event_id
+      WHERE a.project_id = ? AND a.verdict = 'fail'
+      ORDER BY a.id DESC LIMIT 100`).all(projectId)
+      .map((a) => ({
+        id: a.id,
+        runId: a.run_id,
+        checkId: a.check_id,
+        category: a.category,
+        name: a.name,
+        summary: a.summary,
+        evidence: JSON.parse(a.evidence_json),
+        evaluatedAt: a.evaluated_at,
+        scenarioKind: a.kind,
+        scenarioLabel: forwarder.LABELS[a.kind] || a.kind,
+        paypalEventId: a.paypal_event_id,
+        eventType: a.event_type,
+      }));
+  }
 
   function findings(projectId) {
     const rows = db.prepare(`SELECT check_id, MIN(name) AS name, MIN(category) AS category,
@@ -57,7 +100,12 @@ function registerReportRoutes({ app, db, forwarder, requireAuth, getProjectRow }
   }
 
   app.get('/api/projects/:id/findings', requireAuth, (req, res) => {
-    res.json({ findings: findings(getProjectRow(req.params.id).id), guidanceNote: 'Guidance is general advice for this kind of failure. It is not generated from your code.' });
+    const pid = getProjectRow(req.params.id).id;
+    res.json({
+      findings: findings(pid),
+      failedAssertions: failedAssertions(pid),
+      guidanceNote: 'Guidance is general advice for this kind of failure. It is not generated from your code.',
+    });
   });
 
   function collect(project, { verdict, runId }) {

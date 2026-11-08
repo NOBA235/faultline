@@ -72,6 +72,13 @@ test('[fixture] overview numbers equal what is stored', async () => {
   assert.equal(o.paypalCalls, count('paypal_api_calls'));
   assert.equal(o.recentRuns.length, 2);
   assert.equal(o.recentRuns[0].label, 'Dropped delivery');
+  assert.equal(o.recentRuns[0].dropped, true);
+  assert.equal(o.recentRuns[1].requestsSent, 3);
+  const evDetail = (await t.request('GET', `/api/projects/${pid}/events/${e1}`)).json;
+  assert.match(evDetail.rawSha256, /^[0-9a-f]{64}$/);
+  assert.equal(evDetail.runs.length, 1);
+  assert.equal(evDetail.runs[0].requestsSent, 3);
+  assert.equal(evDetail.runs[0].attempts.length, 3);
 });
 
 test('[fixture] findings list failing checks first, with static guidance and the last failing run', async () => {
@@ -86,6 +93,9 @@ test('[fixture] findings list failing checks first, with static guidance and the
   assert.match(f.guidanceNote, /not generated from your code/);
   assert.equal(f.findings[0].kind, 'failing');
   assert.ok(!f.findings.some((x) => x.checkId === 'valid_state_transition'), 'a passing check is not a finding');
+  assert.ok(Array.isArray(f.failedAssertions) && f.failedAssertions.length >= 2);
+  assert.equal(f.failedAssertions[0].runId, d.run.id);
+  assert.ok(Array.isArray(f.failedAssertions[0].evidence) && f.failedAssertions[0].evidence.length > 0);
 });
 
 test('[fixture] checks that could never be evaluated are reported as such, not as passes', async () => {

@@ -24,13 +24,13 @@
   };
 
   const state = {
-    projects: [], selectedId: null, view: 'empty', detail: null, busy: false,
+    projects: [], selectedId: null, view: 'empty', tab: 'all', detail: null, busy: false,
     orders: [], calls: [], orderDetail: null, orderError: null, orderErrorScope: 'create', orderProjectId: null, orderKey: null,
     orderForm: { amount: '10.00', currency: 'USD', description: '' },
     events: [], eventTotal: 0, eventTypes: [], deliveries: [], eventDetail: null, eventError: null, webhookError: null,
     eventFilters: { status: '', type: '', q: '' },
-    runs: [], runDetail: null, runError: null, scenarioKey: null,
-    overview: null, findings: [], runFilter: '', probeResult: null, probeError: null,
+    runs: [], runDetail: null, runError: null, scenarioKey: null, labEventId: '',
+    overview: null, findings: [], failedAssertions: [], runFilter: '', runKindFilter: '', probeResult: null, probeError: null,
     scenarioForm: { kind: 'forward', count: '3', mode: 'sequential', delaySeconds: '10' },
     aiPrompt: 'Test whether my application processes the same completed payment webhook twice.',
     aiPlans: [], aiSelectedPlan: null, aiPlanEventId: '', aiPlanError: null,
@@ -193,7 +193,8 @@
       if (state.orderProjectId !== id) {
         state.orderDetail = null; state.orderError = null; state.orderKey = newKey();
         state.eventDetail = null; state.eventError = null; state.webhookError = null; state.eventFilters = { status: '', type: '', q: '' };
-        state.runDetail = null; state.runError = null; state.scenarioKey = newKey();
+        state.runDetail = null; state.runError = null; state.scenarioKey = newKey(); state.labEventId = '';
+        state.runFilter = ''; state.runKindFilter = '';
         state.aiPlans = []; state.aiSelectedPlan = null; state.aiPlanEventId = ''; state.aiPlanError = null;
         state.aiAnalysis = null; state.aiAnalysisRunId = ''; state.aiAnalysisError = null; state.aiSuggestions = null;
       }
@@ -367,7 +368,35 @@
           h('thead', null, h('tr', null, ['Time', 'Result', 'HTTP', 'Duration', 'Error code', 'PayPal debug ID'].map((t) => h('th', { scope: 'col' }, t)))),
           h('tbody', null, rows))));
 
-    return [header, alert, overviewPanel(), facts, ...ordersSection(p), webhookPanel(p), probePanel(p), ...eventsSection(p), history];
+    const nav = workspaceTabs();
+    const t = state.tab || 'all';
+    if (t === 'overview') return [header, alert, nav, overviewPanel(p)];
+    if (t === 'sandbox') return [header, alert, nav, facts, webhookPanel(p), probePanel(p), ...ordersSection(p), history];
+    if (t === 'events') return [header, alert, nav, ...eventsExplorerOnly(p)];
+    if (t === 'lab') return [header, alert, nav, testLabPanel(p), state.runDetail ? runDetailPanel(p) : null, runsPanel(p)];
+    if (t === 'ai') return [header, alert, nav, aiEngineerPanel(p), state.runDetail ? runDetailPanel(p) : null];
+    if (t === 'reports') return [header, alert, nav, reportsPanel(p), state.runDetail ? runDetailPanel(p) : null, runsPanel(p)];
+    return [header, alert, nav, overviewPanel(p), facts, ...ordersSection(p), webhookPanel(p), probePanel(p), testLabPanel(p), ...eventsSection(p), history];
+  }
+
+  function workspaceTabs() {
+    const o = state.overview;
+    const tabs = [
+      ['all', 'All Views', null],
+      ['overview', 'Overview', null],
+      ['sandbox', 'Project & Sandbox', o ? o.orders.total : null],
+      ['events', 'Event Explorer', o ? o.events.total : null],
+      ['lab', 'Test Lab', o ? o.runs.total : null],
+      ['ai', 'AI Test Engineer', state.aiPlans.length || null],
+      ['reports', 'Reports', o ? o.failedChecks : null],
+    ];
+    return h('nav', { class: 'subnav', 'aria-label': 'Workspace sections' },
+      tabs.map(([id, label, count]) => h('button', {
+        class: 'subnav-btn',
+        type: 'button',
+        'aria-current': String((state.tab || 'all') === id),
+        onclick: () => { state.tab = id; renderMain(); },
+      }, label, count !== null && count !== undefined ? h('span', { class: 'subnav-count' }, String(count)) : null)));
   }
 
 
@@ -570,11 +599,17 @@
       api('GET', `/api/projects/${projectId}/ai/plans`),
       api('GET', `/api/projects/${projectId}/ai/suggestions`),
     ]);
-    state.overview = o; state.findings = fnd.findings;
+    state.overview = o; state.findings = fnd.findings; state.failedAssertions = fnd.failedAssertions || [];
     state.events = e.events; state.eventTotal = e.total; state.eventTypes = e.eventTypes; state.deliveries = d.deliveries; state.calls = c.calls; state.runs = r.runs;
     state.aiPlans = plans.plans; state.aiSuggestions = sug;
     if (state.aiSelectedPlan) state.aiSelectedPlan = state.aiPlans.find((x) => x.id === state.aiSelectedPlan.id) || state.aiPlans[0] || null;
     else if (state.aiPlans.length) state.aiSelectedPlan = state.aiPlans[0];
+    const verified = state.events.filter((x) => x.verification.status === 'verified');
+    if (!state.labEventId || !verified.some((x) => x.id === state.labEventId)) {
+      state.labEventId = (state.eventDetail && state.eventDetail.event.verification.status === 'verified')
+        ? state.eventDetail.event.id
+        : (verified[0] ? verified[0].id : '');
+    }
   }
 
   async function eventAction(p, btn, busyText, fn) {
@@ -632,7 +667,40 @@
       form);
   }
 
-  function eventsSection(p) {
+  const PROCESSING_BADGE = {
+    stored: ['idle', 'Stored'],
+    forwarded: ['ok', 'Forwarded'],
+    forward_failed: ['bad', 'Forward failed'],
+    dropped: ['drop', 'Dropped'],
+  };
+  const processingBadge = (status) => {
+    const [cls, label] = PROCESSING_BADGE[status] || ['idle', pretty(status)];
+    return h('span', { class: `badge ${cls}` }, label);
+  };
+  const KIND_BADGE = {
+    original: ['ok', 'Original'],
+    duplicate: ['info', 'Duplicate'],
+    delayed: ['delay', 'Delayed'],
+    dropped: ['drop', 'Dropped'],
+    replay: ['replay', 'Replay'],
+  };
+  const kindBadge = (k) => {
+    const [cls, label] = KIND_BADGE[k] || ['idle', KIND_TEXT[k] || pretty(k)];
+    return h('span', { class: `badge ${cls}` }, label);
+  };
+  const SCENARIO_BADGE = {
+    forward: ['ok', 'Forward once'],
+    duplicate: ['info', 'Duplicate delivery'],
+    delay: ['delay', 'Delayed delivery'],
+    drop: ['drop', 'Dropped delivery'],
+    replay: ['replay', 'Replay delivery'],
+  };
+  const scenarioBadge = (k, labelFallback) => {
+    const [cls, label] = SCENARIO_BADGE[k] || ['idle', labelFallback || pretty(k)];
+    return h('span', { class: `badge ${cls}` }, labelFallback || label);
+  };
+
+  function explorerTablePanel(p) {
     const f = state.eventFilters;
     const status = h('select', { id: 'filterStatus', 'aria-label': 'Verification status', onchange: (e) => { f.status = e.target.value; reloadEvents(p); } },
       [['', 'All verification states'], ['verified', 'Verified'], ['failed', 'Verification failed'], ['error', 'Could not verify'], ['unverified', 'Not verified']]
@@ -649,12 +717,12 @@
       h('td', { class: 'mono' }, e.paypalEventId || '\u2014'),
       h('td', { class: 'mono' }, e.resourceId || '\u2014'),
       h('td', null, verifyBadge(e.verification.status)),
-      h('td', null, pretty(e.processingStatus)),
+      h('td', null, processingBadge(e.processingStatus)),
       h('td', { class: 'mono' }, e.relatedOrder && e.relatedOrder.paypalOrderId ? e.relatedOrder.paypalOrderId : 'Not linked'),
       h('td', null, e.deliveryCount),
       h('td', null, h('button', { class: 'btn', type: 'button', onclick: () => openEvent(p, e.id) }, 'Open'))));
 
-    const explorer = h('section', { class: 'panel' },
+    return h('section', { class: 'panel' },
       h('h2', { class: 'section' }, 'Event explorer'),
       h('p', { class: 'hint-text' }, 'Every delivery that reaches the receiver URL is stored here exactly as received, with the verdict PayPal gave on its signature.'),
       h('div', { class: 'row-form' }, status, type, q, refresh),
@@ -665,8 +733,18 @@
           h('thead', null, h('tr', null, ['Received', 'Event type', 'PayPal event ID', 'Resource ID', 'Verification', 'Processing', 'Faultline order', 'Deliveries', ''].map((t) => h('th', { scope: 'col' }, t)))),
           h('tbody', null, rows))),
       state.events.length ? h('p', { class: 'hint-text spaced-top' }, `Showing ${state.events.length} of ${state.eventTotal}.`) : null);
+  }
 
-    const parts = [explorer];
+  function eventsExplorerOnly(p) {
+    const parts = [explorerTablePanel(p)];
+    if (state.eventDetail) parts.push(eventDetailPanel(p));
+    if (state.runDetail) parts.push(runDetailPanel(p));
+    parts.push(deliveriesPanel());
+    return parts;
+  }
+
+  function eventsSection(p) {
+    const parts = [explorerTablePanel(p)];
     if (state.eventDetail) parts.push(eventDetailPanel(p));
     parts.push(runsPanel(p));
     if (state.runDetail) parts.push(runDetailPanel(p));
@@ -684,8 +762,119 @@
 
   async function openEvent(p, eventId) {
     state.eventError = null;
-    try { state.eventDetail = await api('GET', `/api/projects/${p.id}/events/${eventId}`); } catch (ex) { state.eventError = ex; }
+    try {
+      state.eventDetail = await api('GET', `/api/projects/${p.id}/events/${eventId}`);
+      if (state.eventDetail.event.verification.status === 'verified') state.labEventId = eventId;
+    } catch (ex) { state.eventError = ex; }
     renderMain();
+  }
+
+  function eventTimelineView(d) {
+    const e = d.event;
+    const items = [];
+    if (e.paypalEventCreatedAt) {
+      items.push({ time: e.paypalEventCreatedAt, dot: 'info', title: 'Event created by PayPal Sandbox', detail: `${e.eventType || 'Webhook'} (${e.paypalEventId || 'no ID'}) on resource ${e.resourceId || 'n/a'}.` });
+    }
+    if (e.originalDeliveryTime) {
+      items.push({ time: e.originalDeliveryTime, dot: 'info', title: 'Original PayPal transmission timestamp', detail: 'Value of the paypal-transmission-time header signed by PayPal.' });
+    }
+    for (const del of d.deliveries || []) {
+      const vCls = del.verificationStatus === 'verified' ? 'ok' : del.verificationStatus === 'failed' ? 'bad' : 'warn';
+      items.push({
+        time: del.receivedAt,
+        dot: vCls,
+        title: del.isRedelivery ? 'Inbound redelivery received by Faultline' : 'First inbound delivery received by Faultline',
+        badge: verifyBadge(del.verificationStatus),
+        detail: `Faultline answered HTTP ${del.responseStatus} (${del.bodyBytes} bytes).`,
+      });
+    }
+    for (const r of (d.runs || []).slice().reverse()) {
+      if (r.dropped) {
+        items.push({
+          time: r.createdAt,
+          dot: 'warn',
+          title: `Fault injection: ${r.label || SCENARIOS[r.kind][0]}`,
+          badge: kindBadge('dropped'),
+          detail: `Deliberately withheld from ${r.destination || 'destination'} (0 HTTP requests sent). Verdict: ${r.verdict || 'pending'}.`,
+        });
+      } else if (r.attempts && r.attempts.length) {
+        for (const a of r.attempts) {
+          const ok = a.outcome === 'delivered';
+          items.push({
+            time: a.sentAt || r.createdAt,
+            dot: ok ? 'ok' : 'bad',
+            title: `${r.label || SCENARIOS[r.kind][0]} — Attempt ${a.attemptNo} of ${r.plannedAttempts}`,
+            badge: kindBadge(a.deliveryKind),
+            detail: `${a.httpStatus ? `HTTP ${a.httpStatus}` : pretty(a.outcome)} in ${a.durationMs} ms \u00B7 Run verdict: ${r.verdict || r.status}`,
+          });
+        }
+      } else {
+        items.push({
+          time: r.createdAt,
+          dot: 'warn',
+          title: `Scenario scheduled/started: ${r.label || SCENARIOS[r.kind][0]}`,
+          badge: runBadge(r.status),
+          detail: `${r.plannedAttempts} planned delivery attempt(s).`,
+        });
+      }
+    }
+    if (!items.length) return null;
+    return h('div', null,
+      h('h2', { class: 'section spaced' }, 'Event lifecycle timeline'),
+      h('div', { class: 'timeline' }, items.map((it) => h('div', { class: 'tl-item' },
+        h('span', { class: `tl-dot ${it.dot}`, 'aria-hidden': 'true' }),
+        h('div', { class: 'tl-head' }, h('span', null, it.title), it.badge || null, h('span', { class: 'tl-time' }, fmtTime(it.time))),
+        h('div', { class: 'tl-body' }, it.detail)))));
+  }
+
+  function structuredPayloadView(d) {
+    const p = d.payload;
+    if (!p || typeof p !== 'object') return null;
+    const res = p.resource && typeof p.resource === 'object' ? p.resource : {};
+    const amt = res.amount || (res.purchase_units && res.purchase_units[0] && res.purchase_units[0].amount) || null;
+    const pairs = [
+      ['PayPal event ID', p.id],
+      ['Event type', p.event_type],
+      ['Event version', p.event_version],
+      ['Resource type', p.resource_type],
+      ['Resource version', p.resource_version],
+      ['Resource ID', res.id],
+      ['Resource status', res.status],
+      ['Amount', amt && amt.value ? `${amt.value} ${amt.currency_code || ''}`.trim() : null],
+      ['Custom ID', res.custom_id || (res.purchase_units && res.purchase_units[0] && res.purchase_units[0].custom_id)],
+      ['Final capture', typeof res.final_capture === 'boolean' ? (res.final_capture ? 'Yes' : 'No') : null],
+      ['Summary', p.summary],
+      ['Raw body SHA-256', d.rawSha256],
+    ].filter(([, val]) => val !== undefined && val !== null && val !== '');
+    if (!pairs.length) return null;
+    return h('div', null,
+      h('h2', { class: 'section spaced' }, 'Structured payload summary'),
+      h('div', { class: 'table-wrap' }, h('table', { class: 'checks' },
+        h('thead', null, h('tr', null, ['Field', 'Value in signed PayPal payload'].map((t) => h('th', { scope: 'col' }, t)))),
+        h('tbody', null, pairs.map(([k, v]) => h('tr', null, h('td', null, k), h('td', { class: 'mono wrap' }, String(v))))))));
+  }
+
+  function eventFaultHistoryView(p, d) {
+    const runs = d.runs || [];
+    return h('div', null,
+      h('h2', { class: 'section spaced' }, 'Fault-injection history on this event'),
+      runs.length === 0
+        ? h('p', { class: 'empty' }, 'No forwarding or fault-injection scenarios have been run on this event yet.')
+        : h('div', { class: 'table-wrap' }, h('table', { class: 'checks' },
+          h('thead', null, h('tr', null, ['Created', 'Scenario', 'Source', 'Status', 'Verdict', 'Deliveries sent', 'HTTP replies', ''].map((t) => h('th', { scope: 'col' }, t)))),
+          h('tbody', null, runs.map((r) => h('tr', { class: state.runDetail && state.runDetail.run.id === r.id ? 'selected' : null },
+            h('td', null, fmtTime(r.createdAt)),
+            h('td', null, scenarioBadge(r.kind, r.label || (SCENARIOS[r.kind] && SCENARIOS[r.kind][0]))),
+            h('td', null, r.triggeredBy === 'auto' ? 'Automatic' : r.triggeredBy === 'ai_plan' ? 'AI test plan' : 'Manual (Test Lab)'),
+            h('td', null, runBadge(r.status)),
+            h('td', null, verdictBadge(r.verdict)),
+            h('td', null, r.dropped ? 'None (dropped)' : `${r.requestsSent ?? '\u2014'} of ${r.plannedAttempts}`),
+            h('td', { class: 'mono' }, r.statusCodes && r.statusCodes.length ? r.statusCodes.map((c) => c ?? 'no reply').join(', ') : '\u2014'),
+            h('td', null, h('button', { class: 'btn', type: 'button', onclick: async () => {
+              state.runError = null;
+              try { state.runDetail = await api('GET', `/api/projects/${p.id}/scenario-runs/${r.id}`); } catch (ex) { state.runError = ex; }
+              renderMain();
+            } }, 'Inspect run'))))))));
   }
 
   function eventDetailPanel(p) {
@@ -701,7 +890,7 @@
       h('td', null, x.isRedelivery ? 'Yes (same event again)' : 'First delivery'), h('td', null, `${x.bodyBytes} bytes`)));
     return h('section', { class: 'panel' },
       h('div', { class: 'title-row' },
-        h('h2', { class: 'section nomargin' }, e.eventType || 'Event'), verifyBadge(v.status),
+        h('h2', { class: 'section nomargin' }, e.eventType || 'Event'), verifyBadge(v.status), processingBadge(e.processingStatus),
         h('div', { class: 'actions' }, reverify)),
       state.eventError ? errorBox(state.eventError) : null,
       v.status === 'verified' ? null : h('div', { class: `alert ${v.status === 'failed' ? 'bad' : v.status === 'error' ? 'warn' : 'idle'}`, role: 'status' },
@@ -715,12 +904,15 @@
         h('dt', null, 'Received by Faultline'), h('dd', null, fmtTime(e.receivedAt)),
         h('dt', null, 'Processing status'), h('dd', null, PROCESSING_TEXT[e.processingStatus] || pretty(e.processingStatus)),
         h('dt', null, 'Faultline order'), h('dd', null, e.relatedOrder ? `Linked to order ${e.relatedOrder.paypalOrderId || e.relatedOrder.id}` : 'Not linked to an order Faultline created'),
-        h('dt', null, 'Size'), h('dd', null, `${d.rawBytes} bytes`)),
+        h('dt', null, 'Size / SHA-256'), h('dd', { class: 'mono wrap' }, `${d.rawBytes} bytes${d.rawSha256 ? ` \u00B7 sha256:${d.rawSha256}` : ''}`)),
       scenarioLab(p, d),
-      h('h2', { class: 'section spaced' }, 'Delivery history'),
+      eventTimelineView(d),
+      eventFaultHistoryView(p, d),
+      h('h2', { class: 'section spaced' }, 'Inbound delivery history (from PayPal)'),
       h('div', { class: 'table-wrap' }, h('table', { class: 'checks' },
         h('thead', null, h('tr', null, ['Received', 'Verification', 'Our response', 'Kind', 'Size'].map((t) => h('th', { scope: 'col' }, t)))),
         h('tbody', null, deliveryRows))),
+      structuredPayloadView(d),
       h('details', { class: 'raw-wrap' }, h('summary', null, 'Headers saved with this event'),
         h('div', { class: 'table-wrap' }, h('table', { class: 'checks' }, h('tbody', null, headerRows)))),
       d.payload ? h('details', { class: 'raw-wrap' }, h('summary', null, 'Payload (formatted for reading)'), h('pre', { class: 'raw' }, JSON.stringify(d.payload, null, 2))) : null,
@@ -864,13 +1056,93 @@
       d.runs.length ? h('p', { class: 'hint-text' }, `Runs on this event: ${d.runs.map((r) => `${SCENARIOS[r.kind][0]} (${RUN_TEXT[r.status] || r.status})`).join(', ')}.`) : null);
   }
 
+  function testLabPanel(p) {
+    const verified = state.events.filter((e) => e.verification.status === 'verified');
+    if (verified.length === 0) {
+      return h('section', { class: 'panel' },
+        h('h2', { class: 'section' }, 'Test Lab'),
+        h('p', { class: 'hint-text' }, 'Select a genuine PayPal-verified webhook event and execute controlled fault-injection scenarios against your application endpoint.'),
+        h('p', { class: 'empty' }, 'No PayPal-verified webhook events are stored in this project yet. Receive a verified webhook from PayPal Sandbox (or verify an existing delivery in Event Explorer) to unlock Test Lab.'));
+    }
+    const selectedId = state.labEventId && verified.some((e) => e.id === state.labEventId) ? state.labEventId : verified[0].id;
+    const selectedEv = verified.find((e) => e.id === selectedId) || verified[0];
+    const f = state.scenarioForm;
+
+    const evSelect = h('select', {
+      id: 'labEventSelect',
+      'aria-label': 'Verified source event for Test Lab',
+      onchange: async (ev) => {
+        state.labEventId = ev.target.value;
+        try { state.eventDetail = await api('GET', `/api/projects/${p.id}/events/${state.labEventId}`); } catch { /* ignore */ }
+        renderMain();
+      },
+    }, verified.map((e) => h('option', { value: e.id, selected: e.id === selectedEv.id }, `${e.eventType || 'Event'} \u00B7 ${e.paypalEventId || e.id.slice(0, 8)} (${fmtTime(e.receivedAt)})`)));
+
+    const kind = h('select', { id: 'labScenarioKind', onchange: (ev) => { f.kind = ev.target.value; renderMain(); } },
+      Object.entries(SCENARIOS).map(([k, [label]]) => h('option', { value: k, selected: k === f.kind }, label)));
+    const extra = [];
+    if (f.kind === 'duplicate') {
+      extra.push(h('label', { class: 'field', for: 'labScenarioCount' }, h('span', { class: 'label' }, 'Total deliveries'),
+        h('input', { id: 'labScenarioCount', type: 'number', min: '2', max: '10', value: f.count, oninput: (ev) => { f.count = ev.target.value; } })));
+      extra.push(h('label', { class: 'field', for: 'labScenarioMode' }, h('span', { class: 'label' }, 'Timing'),
+        h('select', { id: 'labScenarioMode', onchange: (ev) => { f.mode = ev.target.value; } },
+          h('option', { value: 'sequential', selected: f.mode === 'sequential' }, 'One after another'),
+          h('option', { value: 'concurrent', selected: f.mode === 'concurrent' }, 'All at the same time'))));
+    }
+    if (f.kind === 'delay') {
+      extra.push(h('label', { class: 'field', for: 'labScenarioDelay' }, h('span', { class: 'label' }, 'Delay (seconds)'),
+        h('input', { id: 'labScenarioDelay', type: 'number', min: '1', max: '3600', value: f.delaySeconds, oninput: (ev) => { f.delaySeconds = ev.target.value; } })));
+    }
+    const go = h('button', { class: 'btn primary', type: 'submit' }, f.kind === 'drop' ? 'Drop selected event' : 'Execute scenario');
+    const form = h('form', { class: 'row-form', novalidate: true, onsubmit: async (ev) => {
+      ev.preventDefault();
+      go.disabled = true; go.textContent = 'Starting\u2026';
+      state.runError = null;
+      const body = { kind: f.kind, idempotencyKey: state.scenarioKey };
+      if (f.kind === 'duplicate') { body.count = f.count; body.mode = f.mode; }
+      if (f.kind === 'delay') body.delaySeconds = f.delaySeconds;
+      try {
+        const data = await api('POST', `/api/projects/${p.id}/events/${selectedEv.id}/scenarios`, body);
+        state.scenarioKey = newKey();
+        state.runDetail = await api('GET', `/api/projects/${p.id}/scenario-runs/${data.run.id}`);
+        await loadEventData(p.id);
+        state.eventDetail = await api('GET', `/api/projects/${p.id}/events/${selectedEv.id}`);
+      } catch (ex) {
+        if (ex.status === 401) return showLogin('Your session ended. Sign in again.');
+        state.runError = ex;
+      }
+      renderMain();
+    } },
+    h('label', { class: 'field grow', for: 'labEventSelect' }, h('span', { class: 'label' }, 'Verified PayPal event'), evSelect),
+    h('label', { class: 'field', for: 'labScenarioKind' }, h('span', { class: 'label' }, 'Fault scenario'), kind),
+    ...extra,
+    h('div', { class: 'field' }, h('span', { class: 'label' }, '\u00A0'), go));
+
+    return h('section', { class: 'panel lab' },
+      h('div', { class: 'title-row' },
+        h('h2', { class: 'section nomargin' }, 'Test Lab'),
+        scenarioBadge(f.kind),
+        verifyBadge('verified')),
+      h('p', { class: 'hint-text' }, `${SCENARIOS[f.kind][1]} Target destination: `, h('span', { class: 'mono' }, p.webhookEndpointUrl)),
+      form,
+      state.runError ? errorBox(state.runError) : null,
+      h('dl', { class: 'facts' },
+        h('dt', null, 'Selected event ID'), h('dd', { class: 'mono' }, selectedEv.paypalEventId || selectedEv.id),
+        h('dt', null, 'Event type & resource'), h('dd', { class: 'mono' }, `${selectedEv.eventType || '\u2014'} \u00B7 resource ${selectedEv.resourceId || '\u2014'}`),
+        h('dt', null, 'Current processing status'), h('dd', null, processingBadge(selectedEv.processingStatus), ' ', PROCESSING_TEXT[selectedEv.processingStatus] || '')),
+      h('p', { class: 'hint-text spaced-top' }, 'The original event body and PayPal signature headers are preserved byte-for-byte. Faultline adds X-Faultline-* headers so your application and test logs can distinguish original, duplicate, delayed, and replayed deliveries.'));
+  }
+
   function runsPanel(p) {
-    const shown = state.runs.filter((r) => !state.runFilter || r.verdict === state.runFilter);
+    const shown = state.runs.filter((r) => (!state.runFilter || r.verdict === state.runFilter) && (!state.runKindFilter || r.kind === state.runKindFilter));
     const filter = h('select', { id: 'runFilter', 'aria-label': 'Verdict filter', onchange: (e) => { state.runFilter = e.target.value; renderMain(); } },
       [['', 'All verdicts'], ['passed', 'Passed'], ['failed', 'Failed'], ['inconclusive', 'Inconclusive']].map(([v, l]) => h('option', { value: v, selected: v === state.runFilter }, l)));
+    const kindFilter = h('select', { id: 'runKindFilter', 'aria-label': 'Scenario kind filter', onchange: (e) => { state.runKindFilter = e.target.value; renderMain(); } },
+      [['', 'All scenario types'], ['forward', 'Forward once'], ['duplicate', 'Duplicate delivery'], ['delay', 'Delayed delivery'], ['drop', 'Dropped delivery'], ['replay', 'Replay delivery']]
+        .map(([v, l]) => h('option', { value: v, selected: v === state.runKindFilter }, l)));
     const rows = shown.map((r) => h('tr', { class: state.runDetail && state.runDetail.run.id === r.id ? 'selected' : null },
       h('td', null, fmtTime(r.createdAt)),
-      h('td', null, r.label, r.triggeredBy === 'auto' ? ' (automatic)' : r.triggeredBy === 'ai_plan' ? ' (from AI plan)' : ''),
+      h('td', null, scenarioBadge(r.kind, r.label), r.triggeredBy === 'auto' ? ' (automatic)' : r.triggeredBy === 'ai_plan' ? ' (from AI plan)' : ''),
       h('td', { class: 'mono' }, r.paypalEventId || '\u2014'),
       h('td', null, runBadge(r.status)),
       h('td', null, verdictBadge(r.verdict)),
@@ -884,12 +1156,90 @@
     return h('section', { class: 'panel' },
       h('h2', { class: 'section' }, 'Test history'),
       h('p', { class: 'hint-text' }, 'Every forward, duplicate, delayed, dropped and replayed delivery, with what your endpoint answered and the verdict from the checks.'),
-      state.runs.length ? h('div', { class: 'row-form' }, filter) : null,
+      state.runs.length ? h('div', { class: 'row-form' }, filter, kindFilter) : null,
       state.runs.length === 0 ? h('p', { class: 'empty' }, 'No scenarios yet. Open a verified event above and run one.')
-        : shown.length === 0 ? h('p', { class: 'empty' }, 'No runs have this verdict.')
+        : shown.length === 0 ? h('p', { class: 'empty' }, 'No runs match these filters.')
         : h('div', { class: 'table-wrap' }, h('table', { class: 'checks' },
           h('thead', null, h('tr', null, ['Created', 'Scenario', 'PayPal event ID', 'Status', 'Verdict', 'Requests sent', 'HTTP replies', ''].map((t) => h('th', { scope: 'col' }, t)))),
           h('tbody', null, rows))));
+  }
+
+  function runTimelineView(d) {
+    const { run, attempts, result, snapshots = [], event } = d;
+    const items = [];
+    if (event && event.receivedAt) {
+      items.push({ time: event.receivedAt, dot: 'info', title: 'Original PayPal event received by Faultline', detail: `${event.eventType || 'Event'} (${event.paypalEventId || event.id})` });
+    }
+    const beforeProbe = snapshots.find((s) => s.source === 'probe' && s.phase === 'before');
+    if (beforeProbe) {
+      items.push({
+        time: beforeProbe.takenAt,
+        dot: beforeProbe.outcome === 'ok' ? 'info' : 'warn',
+        title: 'Pre-scenario State Probe snapshot',
+        detail: beforeProbe.outcome === 'ok'
+          ? `processed_count=${beforeProbe.data.processedCount ?? 'n/a'}, status=${beforeProbe.data.status || 'n/a'}, payment_records=${beforeProbe.data.paymentRecords ?? 'n/a'}`
+          : (beforeProbe.errorText || 'Probe could not be read'),
+      });
+    }
+    if (result.delay) {
+      items.push({
+        time: run.createdAt,
+        dot: 'warn',
+        title: `Delayed delivery hold window (${result.delay.requestedSeconds} s requested)`,
+        badge: kindBadge('delayed'),
+        detail: result.delay.forwardedAt
+          ? `Held until ${fmtTime(result.delay.forwardedAt)} (${(result.delay.waitedMs / 1000).toFixed(1)} s after run start).`
+          : `Scheduled to send at ${fmtTime(run.scheduledFor)}.`,
+      });
+    }
+    for (const a of attempts) {
+      if (a.outcome === 'dropped') {
+        items.push({
+          time: a.sentAt || run.finishedAt || run.createdAt,
+          dot: 'warn',
+          title: 'Webhook deliberately dropped by Faultline',
+          badge: kindBadge('dropped'),
+          detail: '0 HTTP requests sent to destination.',
+        });
+      } else {
+        const ok = a.outcome === 'delivered';
+        items.push({
+          time: a.sentAt,
+          dot: ok ? 'ok' : 'bad',
+          title: `Attempt ${a.attemptNo} of ${run.plannedAttempts} to destination`,
+          badge: kindBadge(a.deliveryKind),
+          detail: `${a.httpStatus ? `HTTP ${a.httpStatus}` : pretty(a.outcome)} in ${a.durationMs} ms${a.responseSnippet ? ` \u2014 "${a.responseSnippet.slice(0, 100)}"` : (a.errorText ? ` \u2014 ${a.errorText}` : '')}`,
+        });
+      }
+    }
+    const afterProbe = snapshots.find((s) => s.source === 'probe' && s.phase === 'after');
+    if (afterProbe) {
+      items.push({
+        time: afterProbe.takenAt,
+        dot: afterProbe.outcome === 'ok' ? 'info' : 'warn',
+        title: 'Post-scenario State Probe snapshot',
+        detail: afterProbe.outcome === 'ok'
+          ? `processed_count=${afterProbe.data.processedCount ?? 'n/a'}, status=${afterProbe.data.status || 'n/a'}, payment_records=${afterProbe.data.paymentRecords ?? 'n/a'}`
+          : (afterProbe.errorText || 'Probe could not be read'),
+      });
+    }
+    if (run.finishedAt) {
+      const v = result.verdict.status;
+      items.push({
+        time: run.finishedAt,
+        dot: v === 'passed' ? 'ok' : v === 'failed' ? 'bad' : 'warn',
+        title: 'Deterministic checks evaluated',
+        badge: verdictBadge(run.verdict),
+        detail: result.verdict.message,
+      });
+    }
+    if (!items.length) return null;
+    return h('div', null,
+      h('h2', { class: 'section spaced' }, 'Scenario execution timeline'),
+      h('div', { class: 'timeline' }, items.map((it) => h('div', { class: 'tl-item' },
+        h('span', { class: `tl-dot ${it.dot}`, 'aria-hidden': 'true' }),
+        h('div', { class: 'tl-head' }, h('span', null, it.title), it.badge || null, h('span', { class: 'tl-time' }, fmtTime(it.time))),
+        h('div', { class: 'tl-body' }, it.detail)))));
   }
 
   function runDetailPanel(p) {
@@ -920,7 +1270,7 @@
     const secs = (ms) => (ms === null || ms === undefined ? '\u2014' : `${(ms / 1000).toFixed(1)} s`);
     const attemptRows = attempts.map((a) => h('tr', null,
       h('td', null, `${a.attemptNo} of ${run.plannedAttempts}`),
-      h('td', null, KIND_TEXT[a.deliveryKind] || a.deliveryKind),
+      h('td', null, kindBadge(a.deliveryKind)),
       h('td', null, a.outcome === 'dropped' ? '\u2014' : fmtTime(a.sentAt)),
       h('td', null, outcomeBadge(a.outcome)),
       h('td', { class: 'mono' }, a.httpStatus ?? '\u2014'),
@@ -928,7 +1278,7 @@
       h('td', { class: 'mono wrap' }, a.responseSnippet ? a.responseSnippet.slice(0, 200) : (a.errorText || '\u2014'))));
     const sample = attempts.find((a) => Object.keys(a.requestHeaders).length);
     return h('section', { class: 'panel' },
-      h('div', { class: 'title-row' }, h('h2', { class: 'section nomargin' }, result.scenarioLabel), runBadge(run.status), h('div', { class: 'actions' }, analyzeBtn, cancel)),
+      h('div', { class: 'title-row' }, h('h2', { class: 'section nomargin' }, result.scenarioLabel), scenarioBadge(run.kind), runBadge(run.status), verdictBadge(run.verdict), h('div', { class: 'actions' }, analyzeBtn, cancel)),
       state.runError ? errorBox(state.runError) : null,
       result.dropped ? h('div', { class: 'alert idle', role: 'status' }, h('strong', null, 'Deliberately dropped.'), h('p', { class: 'alert-text' }, 'Faultline held this event back on purpose. Your endpoint received nothing from this run.')) : null,
       run.status === 'scheduled' ? h('div', { class: 'alert warn', role: 'status' }, h('strong', null, 'Waiting to send.'), h('p', { class: 'alert-text' }, `Scheduled for ${fmtTime(run.scheduledFor)}. If Faultline restarts first, the run is picked up again.`)) : null,
@@ -947,6 +1297,7 @@
           h('dt', null, 'Event received by Faultline'), h('dd', null, fmtTime(result.delay.eventReceivedAt)),
           h('dt', null, 'Actually forwarded'), h('dd', null, result.delay.forwardedAt ? `${fmtTime(result.delay.forwardedAt)} (waited ${secs(result.delay.waitedMs)} after the run was created, ${secs(result.delay.heldForMs)} after the event arrived)` : 'Not yet'),
         ] : null),
+      runTimelineView(state.runDetail),
       h('h2', { class: 'section spaced' }, 'What Faultline observed'),
       h('ul', { class: 'plain' }, result.observations.map((o) => h('li', null, o))),
       result.errors.length ? h('ul', { class: 'plain' }, result.errors.map((x) => h('li', null, `Attempt ${x.attempt}: ${x.message}`))) : null,
@@ -964,7 +1315,7 @@
   }
 
 
-  // ---- phase 5: overview, probe, verdicts, reports ------------------------
+  // ---- overview, probe, verdicts, reports ---------------------------------
   const VERDICT = { passed: ['ok', 'Passed'], failed: ['bad', 'Failed'], inconclusive: ['warn', 'Inconclusive'] };
   const verdictBadge = (v) => { const x = VERDICT[v]; return x ? h('span', { class: `badge ${x[0]}` }, x[1]) : h('span', { class: 'badge idle' }, 'Pending'); };
   const CHECK = { pass: ['ok', 'Pass'], fail: ['bad', 'Fail'], not_evaluable: ['warn', 'Not evaluable'], not_applicable: ['idle', 'Not applicable'] };
@@ -1014,7 +1365,72 @@
         h('thead', null, h('tr', null, ['Source', 'When', 'Result', 'What it reported'].map((t) => h('th', { scope: 'col' }, t)))), h('tbody', null, rows))));
   }
 
-  function overviewPanel() {
+  function stackedBarCard(title, segments) {
+    const total = segments.reduce((acc, s) => acc + s.count, 0);
+    return h('div', { class: 'chart-card' },
+      h('div', { class: 'chart-title' }, `${title} (${total})`),
+      h('div', { class: 'bar-track' }, total === 0
+        ? null
+        : segments.filter((s) => s.count > 0).map((s) => h('div', {
+          class: `bar-seg ${s.cls}`,
+          style: `width: ${Math.max(4, Math.round((s.count / total) * 100))}%`,
+          title: `${s.label}: ${s.count}`,
+        }))),
+      h('div', { class: 'bar-legend' }, segments.map((s) => h('span', { class: 'bar-legend-item' },
+        h('span', { class: `bar-swatch ${s.cls}`, 'aria-hidden': 'true' }),
+        `${s.label}: ${s.count}`))));
+  }
+
+  function overviewCharts(o) {
+    const ev = o.events.byVerification || {};
+    const out = o.forwardAttempts.byOutcome || {};
+    const accepted = out.delivered || 0;
+    const dropped = out.dropped || 0;
+    const blocked = out.blocked || 0;
+    const failed = o.forwardAttempts.total - accepted - dropped - blocked;
+    const rv = o.runs.byVerdict || {};
+    return h('div', { class: 'chart-grid' },
+      stackedBarCard('Webhook verification breakdown', [
+        { label: 'Verified', count: ev.verified || 0, cls: 'ok' },
+        { label: 'Failed sig', count: ev.failed || 0, cls: 'bad' },
+        { label: 'Error', count: ev.error || 0, cls: 'warn' },
+        { label: 'Unverified', count: ev.unverified || 0, cls: 'idle' },
+      ]),
+      stackedBarCard('Outbound delivery outcomes', [
+        { label: 'Accepted (2xx)', count: accepted, cls: 'ok' },
+        { label: 'Failed / rejected', count: failed, cls: 'bad' },
+        { label: 'Dropped', count: dropped, cls: 'idle' },
+        { label: 'Blocked', count: blocked, cls: 'warn' },
+      ]),
+      stackedBarCard('Scenario run verdicts', [
+        { label: 'Passed', count: rv.passed || 0, cls: 'ok' },
+        { label: 'Failed', count: rv.failed || 0, cls: 'bad' },
+        { label: 'Inconclusive', count: rv.inconclusive || 0, cls: 'warn' },
+      ]));
+  }
+
+  function recentRunsTable(p, recent) {
+    if (!recent || !recent.length) return null;
+    const rows = recent.map((r) => h('tr', { class: state.runDetail && state.runDetail.run.id === r.id ? 'selected' : null },
+      h('td', null, fmtTime(r.createdAt)),
+      h('td', null, scenarioBadge(r.kind, r.label)),
+      h('td', { class: 'mono' }, r.paypalEventId || '\u2014'),
+      h('td', null, runBadge(r.status)),
+      h('td', null, verdictBadge(r.verdict)),
+      h('td', null, r.dropped ? 'None (dropped)' : (r.requestsSent !== undefined ? `${r.requestsSent} of ${r.plannedAttempts}` : '\u2014')),
+      h('td', null, h('button', { class: 'btn', type: 'button', onclick: async () => {
+        state.runError = null;
+        try { state.runDetail = await api('GET', `/api/projects/${p.id}/scenario-runs/${r.id}`); } catch (ex) { state.runError = ex; }
+        renderMain();
+      } }, 'Inspect'))));
+    return h('div', null,
+      h('h3', { class: 'subsection spaced' }, 'Recently executed scenarios'),
+      h('div', { class: 'table-wrap' }, h('table', { class: 'checks' },
+        h('thead', null, h('tr', null, ['Created', 'Scenario', 'PayPal event ID', 'Status', 'Verdict', 'Deliveries', ''].map((t) => h('th', { scope: 'col' }, t)))),
+        h('tbody', null, rows))));
+  }
+
+  function overviewPanel(p) {
     const o = state.overview;
     if (!o) return null;
     const tile = (label, value, note) => h('div', { class: 'tile' }, h('div', { class: 'tile-value' }, String(value)), h('div', { class: 'tile-label' }, label), note ? h('div', { class: 'tile-note' }, note) : null);
@@ -1029,10 +1445,13 @@
         tile('Sandbox orders', o.orders.total, `${o.captures.total} captured`),
         tile('Webhook events', o.events.total, `${o.events.byVerification.verified || 0} verified by PayPal`),
         tile('Inbound deliveries', o.inboundDeliveries.total, `${o.inboundDeliveries.redeliveries} were redeliveries`),
-        tile('Deliveries to your endpoint', o.forwardAttempts.total, `${accepted} accepted, ${notAccepted} not accepted, ${dropped} dropped`),
+        tile('Deliveries to your endpoint', o.forwardAttempts.total, `${accepted} accepted, ${dropped} dropped`),
+        tile('Failed deliveries', notAccepted, blocked ? `${blocked} blocked pre-flight` : 'Non-2xx, timeout, or unreachable'),
         tile('Scenario runs', o.runs.total, `${v.passed || 0} passed, ${v.failed || 0} failed, ${v.inconclusive || 0} inconclusive`),
         tile('Failed checks', o.failedChecks),
         tile('PayPal API calls', o.paypalCalls)),
+      overviewCharts(o),
+      p ? recentRunsTable(p, o.recentRuns) : null,
       o.probeConfigured ? null : h('p', { class: 'hint-text spaced-top' }, 'No state probe is set up, so no verdict can be \u201cpassed\u201d yet. See State probe below.'));
   }
 
@@ -1106,20 +1525,39 @@ app.get('/faultline-probe', async (req, res) => {
         try { state.runDetail = await api('GET', `/api/projects/${p.id}/scenario-runs/${f.lastFailedRunId}`); } catch (ex) { state.runError = ex; }
         renderMain();
       } }, 'Open last failing run') : '')));
+
+    const failedAssertionRows = (state.failedAssertions || []).map((fa) => h('tr', null,
+      h('td', null, fmtTime(fa.evaluatedAt)),
+      h('td', null, scenarioBadge(fa.scenarioKind, fa.scenarioLabel), h('div', { class: 'hint block mono' }, fa.paypalEventId || fa.eventType || '\u2014')),
+      h('td', null, h('strong', null, fa.name), h('div', { class: 'hint block' }, CATEGORY[fa.category] || fa.category)),
+      h('td', { class: 'wrap' }, fa.summary,
+        fa.evidence && fa.evidence.length ? h('ul', { class: 'plain evidence' }, fa.evidence.map((e) => h('li', null, h('span', { class: 'tag' }, EVIDENCE[e.type] || e.type), ' ', e.text))) : null),
+      h('td', null, h('button', { class: 'btn', type: 'button', onclick: async () => {
+        try { state.runDetail = await api('GET', `/api/projects/${p.id}/scenario-runs/${fa.runId}`); } catch (ex) { state.runError = ex; }
+        renderMain();
+      } }, 'Open run'))));
+
     return h('section', { class: 'panel' },
       h('h2', { class: 'section' }, 'Reports and reliability findings'),
       h('div', { class: 'actions-left' },
         h('a', { class: 'btn primary', href: `/api/projects/${p.id}/report?format=md`, download: '' }, 'Download report (Markdown)'),
         h('a', { class: 'btn', href: `/api/projects/${p.id}/report?format=json`, download: '' }, 'Download full evidence (JSON)')),
       h('p', { class: 'hint-text spaced-top' }, 'Exports contain only stored test evidence, with notices explaining what each label means. No secrets and no AI-written verdicts.'),
+      h('h3', { class: 'subsection spaced' }, 'Reliability findings (grouped by check)'),
       state.findings.length === 0
         ? h('p', { class: 'empty' }, state.runs.length ? 'No failing checks, and every evaluated check was evaluated at least once.' : 'No findings yet. They appear after you run scenarios.')
         : h('div', { class: 'table-wrap' }, h('table', { class: 'checks' },
           h('thead', null, h('tr', null, ['Finding', 'Status', 'General guidance (not generated from your code)', ''].map((t) => h('th', { scope: 'col' }, t)))),
-          h('tbody', null, rows))));
+          h('tbody', null, rows))),
+      h('h3', { class: 'subsection spaced' }, 'Failed assertions across runs'),
+      !state.failedAssertions || state.failedAssertions.length === 0
+        ? h('p', { class: 'empty' }, 'No deterministic assertions have failed in this project.')
+        : h('div', { class: 'table-wrap' }, h('table', { class: 'checks' },
+          h('thead', null, h('tr', null, ['Time', 'Scenario & event', 'Failed check', 'Observed failure & evidence', ''].map((t) => h('th', { scope: 'col' }, t)))),
+          h('tbody', null, failedAssertionRows))));
   }
 
-  // ---- phase 6: AI test engineer -----------------------------------------
+  // ---- AI test engineer ---------------------------------------------------
   const EXAMPLE_PROMPTS = [
     ['Duplicate x2', 'Test whether my application processes the same completed payment webhook twice.'],
     ['Concurrent x3', 'Send 3 concurrent duplicate deliveries of the completed payment webhook at the same time.'],
