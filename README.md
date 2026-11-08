@@ -1,146 +1,190 @@
-# Faultline
+# FAULTLINE
 
-Faultline is a payment reliability and webhook fault-injection testing platform for **PayPal Sandbox** integrations.
+**Payment Reliability & Webhook Chaos Engineering Platform for PayPal Sandbox**
 
-> Don't just test whether your payment works. Test whether it survives failure.
+[![Node.js](https://img.shields.io/badge/Node.js-%3E%3D20%20LTS-339933?logo=node.js&logoColor=white)](https://nodejs.org/)
+[![PayPal Sandbox](https://img.shields.io/badge/PayPal-Sandbox%20REST%20API%20v2-00457C?logo=paypal&logoColor=white)](https://developer.paypal.com/api/rest/)
+[![Database](https://img.shields.io/badge/SQLite-WAL%20%2B%20AES--256--GCM-003B57?logo=sqlite&logoColor=white)](https://www.sqlite.org/)
+[![Tests](https://img.shields.io/badge/Tests-131%20Passing-17724a)](#testing--verification)
 
-Payment systems are event-driven. A payment provider can deliver the same webhook notification more than once, notifications can arrive out of order or late, and handlers can fail partway through database updates. Faultline connects to your real PayPal Sandbox environment, receives and verifies genuine PayPal webhooks, forwards them to your application under controlled failure scenarios (duplicate, delayed, dropped, and replayed delivery), evaluates deterministic financial safety invariants, and provides evidence-based failure analysis.
-
----
-
-## Capabilities Overview
-
-| Area | What Faultline Does |
-|---|---|
-| **Projects & Credentials** | Create and manage testing projects. Validates credentials via live OAuth2 `POST /v1/oauth2/token` against `https://api-m.sandbox.paypal.com`. Encrypts PayPal Sandbox secrets at rest with AES-256-GCM; secrets are never returned in API responses, browser storage, or logs. |
-| **PayPal Sandbox Orders & Captures** | Creates real Sandbox orders (`POST /v2/checkout/orders`), refreshes order status (`GET /v2/checkout/orders/{id}`), captures approved orders (`POST /v2/checkout/orders/{id}/capture`), and inspects capture status (`GET /v2/payments/captures/{capture_id}`). Every PayPal API call is logged with HTTP status, duration, and `paypal-debug-id`. |
-| **Webhook Receiver & Signature Verification** | Receives incoming PayPal webhooks at `PUBLIC_BASE_URL/webhooks/paypal/<projectId>`, preserves the exact raw payload bytes and `PayPal-*` headers, and verifies authenticity via PayPal's `POST /v1/notifications/verify-webhook-signature` API. Never labels unverified payloads as verified. |
-| **Event Explorer** | Search and filter stored webhook events by verification status, event type, PayPal event ID, or resource ID. Inspect structured payload fields, formatted JSON, byte-exact raw body with SHA-256 digest, saved headers, event lifecycle timeline, inbound delivery history, and fault-injection history. |
-| **Test Lab & Fault Injection** | Select any PayPal-verified webhook event and execute **Forward once**, **Duplicate delivery** (2–10 sequential or concurrent copies), **Delayed delivery** (1–3600 seconds), **Dropped delivery** (0 requests sent), or **Replay delivery**. Preserves original PayPal signature headers while adding `X-Faultline-*` metadata headers. |
-| **Deterministic Financial Safety Checks** | Evaluates 11 deterministic checks across delivery integrity, HTTP acceptance, PayPal order/capture state, and optional application state probe snapshots (`before` and `after` each run). Separates directly observed facts from inferred risks and never guesses internal database state without a probe. |
-| **AI Test Engineer** | Converts plain-English test requests into validated structured test specifications, explains scenario failures strictly from stored execution traces (`observations`, `assumptions`, `recommendations`), and suggests integration-specific follow-up tests. Enforces strict guardrails: cannot fabricate events, execute financial operations, access secrets, or override deterministic verdicts. |
-| **Reports & Evidence Exports** | Displays project overview metrics, data-backed distribution breakdowns, reliability findings, failed assertions across runs, and downloadable Markdown (`.md`) and JSON (`.json`) evidence reports. |
+> *"Don't just test whether your payment works. Test whether it survives failure."*
 
 ---
 
-## Core Architecture & Feature Reference
+## The Problem
 
-### 1. Projects & PayPal Sandbox Connection
+Most developers test payment integrations on the happy path: create an order, approve it in the sandbox, receive one webhook, and verify that the database updates.
 
-- Create, edit, and delete projects (project name, PayPal Sandbox Client ID, PayPal Sandbox Secret, webhook destination URL, and optional state probe URL).
-- On project creation, credential update, or when selecting **Check connection**, Faultline sends an authenticated `POST /v1/oauth2/token` (`grant_type=client_credentials`) request to `https://api-m.sandbox.paypal.com`.
-- A project is marked **Connected** only when PayPal returns a valid access token. Otherwise Faultline displays PayPal's actual error (for example `invalid_client`) or `PayPal unreachable` on network/timeout errors.
-- Every connection check is persisted (timestamp, outcome, HTTP status, duration, error code, and PayPal debug ID).
-- PayPal Sandbox Secrets are encrypted with AES-256-GCM using `ENCRYPTION_KEY` and authenticated with the project ID as additional authenticated data (AAD).
+In production, payment systems are distributed and asynchronous:
+- **Duplicate deliveries**: Payment providers use at-least-once delivery. Network blips or slow acknowledgements trigger automatic retries of the same webhook.
+- **Concurrent races**: Two copies of `PAYMENT.CAPTURE.COMPLETED` arriving milliseconds apart can bypass naive `SELECT`-then-`INSERT` checks and credit an account twice.
+- **Out-of-order arrival**: A delayed `CHECKOUT.ORDER.APPROVED` webhook arriving *after* `PAYMENT.CAPTURE.COMPLETED` can regress a paid order back to an uncaptured state.
+- **Partial transaction failures**: A webhook handler that commits a database write before throwing an HTTP `500` invites a provider retry that double-processes the payment.
+- **Dropped notifications**: If a webhook is lost in transit and the application never reconciles against the provider's API, paid orders remain stuck forever.
 
-### 2. PayPal Sandbox Orders & Captures
+**Faultline** makes these abnormal delivery conditions testable, observable, and deterministic against real **PayPal Sandbox** transactions.
 
-All payment operations call the official PayPal Orders v2 and Payments v2 REST APIs on `https://api-m.sandbox.paypal.com`:
+---
 
-| Action | PayPal Sandbox Endpoint |
-|---|---|
-| Create Sandbox order | `POST /v2/checkout/orders` (`intent: CAPTURE`, PayPal wallet context, `PayPal-Request-Id`, `Prefer: return=representation`) |
-| Refresh from PayPal | `GET /v2/checkout/orders/{id}` |
-| Capture payment | `POST /v2/checkout/orders/{id}/capture` (idempotent `PayPal-Request-Id` per order) |
-| Refresh capture details | `GET /v2/payments/captures/{capture_id}` |
+## System Architecture
 
-**Transaction workflow:**
+```mermaid
+flowchart LR
+  subgraph PayPal["PayPal Sandbox (api-m.sandbox.paypal.com)"]
+    OAuth["OAuth2 Token API\n/v1/oauth2/token"]
+    Orders["Orders & Captures v2\n/v2/checkout/orders"]
+    Verify["Signature Verification API\n/v1/notifications/verify-webhook-signature"]
+    Webhooks["Sandbox Webhook Dispatcher"]
+  end
 
-1. Create an order in Faultline. PayPal returns `PAYER_ACTION_REQUIRED` with a buyer approval link.
-2. Open **Approve in PayPal Sandbox** and sign in with a PayPal Sandbox **personal (buyer)** account (found in the PayPal Developer Dashboard under **Testing Tools -> Sandbox Accounts**). Approve the payment.
-3. Return to Faultline and select **Refresh from PayPal**.
-4. Once PayPal reports `APPROVED`, select **Capture payment**. Faultline stores the capture record only when PayPal confirms it.
+  subgraph Faultline["Faultline Platform"]
+    Vault["AES-256-GCM\nCredential Vault"]
+    Ingest["Byte-Exact Webhook Receiver\n/webhooks/paypal/:projectId"]
+    Forwarder["Fault-Injection Engine\nForward · Duplicate · Delay · Drop · Replay"]
+    Checks["11 Deterministic\nFinancial Safety Checks"]
+    AIEngineer["Guardrailed AI Test Engineer\nPlanner · Trace Analyzer · Recommender"]
+    DB[("SQLite (WAL)\nEvents · Runs · Snapshots")]
+  end
 
-**Financial & operational safeguards:**
+  subgraph App["Developer's Target Application"]
+    Handler["Webhook Endpoint\nPOST /webhooks/paypal"]
+    Probe["Test-Only State Probe (Optional)\nGET /faultline-probe"]
+  end
 
-- Statuses, IDs, and amounts displayed come directly from PayPal's responses.
-- Capture is protected by three guards: Faultline blocks capturing an already-completed order, allows only one in-flight capture request per order, and sends a deterministic `PayPal-Request-Id`.
-- Each order carries `custom_id = faultline:<localOrderId>` so incoming webhooks can be deterministically linked to the order that triggered them.
-- Test orders are capped at `10,000.00` in `USD`, `EUR`, `GBP`, `CAD`, or `AUD`.
-
-### 3. Webhook Ingestion, Signature Verification & Event Explorer
-
-Each project exposes a dedicated webhook receiver URL:
-
-```text
-<PUBLIC_BASE_URL>/webhooks/paypal/<projectId>
+  Vault <-->|"Client Credentials"| OAuth
+  Faultline <-->|"Create / Approve / Capture"| Orders
+  Webhooks -->|"Signed Raw Payload"| Ingest
+  Ingest <-->|"Verify Signature + Raw Body"| Verify
+  Ingest --> DB
+  DB --> Forwarder
+  Forwarder -->|"Original Bytes + PayPal Headers\n+ X-Faultline-* Metadata"| Handler
+  Probe -->|"Before & After State Snapshots"| Checks
+  Orders -->|"Before & After Order Snapshots"| Checks
+  Forwarder -->|"HTTP Status, Timing, Body SHA-256"| Checks
+  Checks --> DB
+  DB --> AIEngineer
 ```
 
-For every incoming request, Faultline:
+---
 
-1. Captures the raw request body as exact bytes (never re-serialized) along with PayPal's transmission headers.
-2. Verifies the signature against PayPal's `POST /v1/notifications/verify-webhook-signature` endpoint using the project's configured **PayPal Webhook ID** and the exact raw event payload.
-3. Assigns verification status strictly from PayPal's verification response:
+## Key Capabilities
 
-| Condition | Verification Status | Faultline HTTP Response |
+### 1. Genuine PayPal Sandbox Integration
+- **Live Credential Validation**: Authenticates directly against `https://api-m.sandbox.paypal.com/v1/oauth2/token`. Invalid credentials or unreachable endpoints are reported with PayPal's exact error code and `paypal-debug-id`.
+- **End-to-End Sandbox Checkout Flow**: Creates real Sandbox orders (`POST /v2/checkout/orders`), links to PayPal's buyer approval flow, syncs order status (`GET /v2/checkout/orders/{id}`), captures approved payments (`POST /v2/checkout/orders/{id}/capture`), and inspects capture details (`GET /v2/payments/captures/{id}`).
+- **Cryptographic Webhook Verification**: Preserves every incoming webhook payload **byte-for-byte** (never re-serialized) and verifies authenticity via PayPal's `POST /v1/notifications/verify-webhook-signature` API. Unverified or forged payloads are never labeled as verified and cannot be forwarded.
+
+### 2. Byte-Exact Webhook Fault Injection (Test Lab)
+Select any PayPal-verified webhook event and execute controlled delivery scenarios against your application's webhook endpoint:
+
+| Scenario | What Faultline Does | Failure Mode Tested |
 |---|---|---|
-| PayPal returns `verification_status: "SUCCESS"` | **Verified by PayPal** (`verified`) | `200 OK` |
-| PayPal returns `FAILURE`, headers are missing, or `paypal-cert-url` is not on `*.paypal.com` | **Verification failed** (`failed`) | `401 Unauthorized` |
-| PayPal could not be reached (network error, timeout, 5xx) | **Could not verify** (`error`) | `503 Service Unavailable` (so PayPal retries) |
-| Project has no PayPal Webhook ID configured yet | **Not verified** (`unverified`) | `503 Service Unavailable` (so PayPal retries) |
-| Request body is empty or not a JSON object | Logged in inbound deliveries | `400 Bad Request` |
+| **Forward Once** (`forward`) | Sends the stored verified event once, byte-for-byte. | Baseline webhook signature verification and processing. |
+| **Duplicate Delivery** (`duplicate`) | Sends the same verified event **2 to 10 times**, either **sequentially** or **concurrently** (all at once). | Idempotency keys, unique constraints, and race conditions under parallel redelivery. |
+| **Delayed Delivery** (`delay`) | Holds the received event and forwards it after a configurable delay (**1 to 3,600 seconds**). | Out-of-order webhook arrival, stale-event state regression, and timestamp tolerance. |
+| **Dropped Delivery** (`drop`) | Intentionally withholds the webhook (`0` HTTP requests sent) and records the drop. | Missing-webhook resilience and reconciliation via PayPal's Orders/Captures API. |
+| **Replay Delivery** (`replay`) | Resends a previously processed verified event at a later time. | Long-horizon deduplication and protection against duplicate payment creation. |
 
-- **Natural redeliveries:** If PayPal redelivers the same verified event ID, Faultline records the delivery in the event's inbound delivery history without duplicating the event record. Forged requests with an existing event ID and an invalid signature are recorded separately as failed and never overwrite a verified event.
-- **Registering with PayPal Sandbox:**
-  1. Start an HTTPS tunnel to port 3000 (for example `ngrok http 3000`).
-  2. Set `PUBLIC_BASE_URL=https://<your-tunnel-domain>` in `.env` and restart Faultline.
-  3. Copy the project's **Receiver URL** from Faultline, register it in **PayPal Developer Dashboard -> Apps & Credentials -> Sandbox -> Your App -> Webhooks**, and copy the resulting **Webhook ID** into Faultline.
-  4. Perform a real Sandbox order approval and capture (events from PayPal's Webhooks Simulator cannot be cryptographically verified by PayPal's verification API).
+Every forwarded attempt preserves the original raw JSON bytes and PayPal signature headers (`paypal-transmission-id`, `paypal-transmission-time`, `paypal-transmission-sig`, `paypal-cert-url`, `paypal-auth-algo`) so your application performs its normal signature check, while adding explicit `X-Faultline-*` observability headers:
 
-### 4. Event Forwarding & Fault Injection (Test Lab)
-
-Only PayPal-verified events (`verification_status = 'verified'`) can be forwarded or used in fault-injection scenarios.
-
-**Byte-exact forwarding:** Your application receives the original webhook body byte-for-byte along with PayPal's original signature headers (`paypal-transmission-id`, `paypal-transmission-time`, `paypal-transmission-sig`, `paypal-cert-url`, `paypal-auth-algo`, `paypal-auth-version`, `correlation-id`, `content-type`), allowing your application to run its standard webhook signature verification. Faultline appends explicit metadata headers so fault-injected deliveries are never confused with new financial transactions:
-
-| Header | Description |
-|---|---|
-| `X-Faultline-Scenario` | `forward`, `duplicate`, `delay`, or `replay` |
-| `X-Faultline-Delivery-Kind` | `original`, `duplicate`, `delayed`, or `replay` |
-| `X-Faultline-Attempt` | Attempt counter, e.g. `2/3` |
-| `X-Faultline-Injected` | `false` for baseline single forward; `true` for fault-injected deliveries |
-| `X-Faultline-Original-Event-Id` | Original PayPal event ID (`WH-...`) |
-| `X-Faultline-Original-Received-At` | ISO-8601 timestamp when Faultline first received the event |
-| `X-Faultline-Run-Id` | Faultline scenario run UUID |
-
-**Supported scenarios:**
-
-| Scenario | Behavior |
-|---|---|
-| **Forward once** (`forward`) | Delivers the stored verified event once to your destination endpoint. |
-| **Duplicate delivery** (`duplicate`) | Delivers the exact same verified event 2 to 10 times, either **sequentially** (one after another) or **concurrently** (all at once). |
-| **Delayed delivery** (`delay`) | Holds the verified event and forwards it after a configurable delay (1 to 3,600 seconds). Records original reception time, scheduled time, and actual forwarding time. |
-| **Dropped delivery** (`drop`) | Deliberately withholds the webhook (0 HTTP requests sent) and records that the event was intentionally dropped. |
-| **Replay delivery** (`replay`) | Resends a previously received verified event labeled as a replay while preserving its original PayPal event identity. |
-
-### 5. Deterministic Financial Safety Checks & State Probe
-
-Every completed scenario run is evaluated by deterministic checks in `src/checks.js` using three distinct evidence sources:
-
-- **Observed (`observed`)**: Faultline's own HTTP delivery trace and your endpoint's HTTP status codes, timings, and response snippets.
-- **PayPal (`paypal`)**: Verified PayPal webhook payloads and PayPal Order/Capture snapshots read before and after the run.
-- **Application State Probe (`probe`)**: An optional test-only `GET` endpoint in your application that Faultline queries before and after each scenario run (after waiting `PROBE_SETTLE_MS`, default `500 ms`).
-
-| Deterministic Check | Evidence Source | Pass Criterion |
+| Header | Example Value | Purpose |
 |---|---|---|
-| **Faultline sent the genuine event unchanged** (`injection_integrity`) | Observed | Every forwarded request carried the exact SHA-256 body and PayPal transmission ID of the stored verified event. |
-| **Your endpoint accepted every delivery** (`deliveries_accepted`) | Observed | Every forwarded delivery received an HTTP 2xx response. |
+| `X-Faultline-Scenario` | `duplicate` | Active scenario (`forward`, `duplicate`, `delay`, `replay`) |
+| `X-Faultline-Delivery-Kind` | `duplicate` | Attempt classification (`original`, `duplicate`, `delayed`, `replay`) |
+| `X-Faultline-Attempt` | `2/3` | Attempt index within the scenario run |
+| `X-Faultline-Injected` | `true` | `false` only for a baseline single delivery; `true` for fault-injected attempts |
+| `X-Faultline-Original-Event-Id` | `WH-2WR32451HC0233532-...` | Original PayPal event ID |
+| `X-Faultline-Original-Received-At` | `2026-11-07T14:20:05.112Z` | Timestamp when Faultline first received the event from PayPal |
+| `X-Faultline-Run-Id` | `d4f8c9b0-...` | Faultline scenario run UUID |
+
+### 3. Deterministic Financial Safety Invariants
+An HTTP `200 OK` response only proves that an HTTP server answered—it does not prove that your application handled the payment safely. Faultline evaluates **11 deterministic checks** across three explicit evidence sources:
+1. **Observed (`observed`)**: Faultline's own HTTP delivery trace, status codes, timings, and SHA-256 payload digests.
+2. **PayPal (`paypal`)**: Verified PayPal webhook payloads and PayPal Order/Capture snapshots read before and after the run.
+3. **Application State Probe (`probe`)**: An optional test-only `GET` endpoint in your application that Faultline queries before and after each scenario run.
+
+| Deterministic Check | Evidence | Pass Criterion |
+|---|---|---|
+| **Faultline sent the genuine event unchanged** (`injection_integrity`) | Observed | Every request carried the exact SHA-256 body and PayPal transmission ID of the stored event. |
+| **Your endpoint accepted every delivery** (`deliveries_accepted`) | Observed | Every forwarded request received an HTTP `2xx` response. |
 | **A failed delivery is not reported as processed** (`failed_delivery_not_processed`) | Probe | When all deliveries fail, `event.processed_count` does not increase. |
-| **An accepted delivery was actually processed** (`accepted_delivery_processed`) | Probe | After at least one HTTP 2xx delivery, `event.processed_count >= 1`. |
-| **The same event is processed at most once** (`idempotent_processing`) | Probe | Across duplicate or replayed deliveries, `event.processed_count` is at most 1 (or unchanged if already 1 before the run). |
-| **A repeated webhook does not create a second payment record** (`no_second_payment_in_app`) | Probe | `payment.payment_records` is at most 1 (or unchanged). |
-| **No new capture appeared at PayPal during the test** (`paypal_payment_unchanged`) | PayPal | Capture count on the linked PayPal Sandbox order did not increase during the webhook scenario. |
-| **Refunds reported by PayPal do not exceed the captured amount** (`refund_events_within_captured`) | PayPal | Verified `PAYMENT.CAPTURE.REFUNDED` events for the capture do not sum to more than the captured amount. |
+| **An accepted delivery was actually processed** (`accepted_delivery_processed`) | Probe | After at least one HTTP `2xx` delivery, `event.processed_count >= 1`. |
+| **The same event is processed at most once** (`idempotent_processing`) | Probe | Across duplicate or replayed deliveries, `event.processed_count` never exceeds `1`. |
+| **A repeated webhook does not create a second payment record** (`no_second_payment_in_app`) | Probe | `payment.payment_records` never exceeds `1` for the same capture or order. |
+| **No new capture appeared at PayPal during the test** (`paypal_payment_unchanged`) | PayPal | Capture count on the linked PayPal Sandbox order did not increase during the webhook test. |
+| **Refunds reported by PayPal do not exceed the captured amount** (`refund_events_within_captured`) | PayPal | Verified `PAYMENT.CAPTURE.REFUNDED` events do not sum to more than the captured amount. |
 | **Refunds in your application do not exceed the captured amount** (`app_refunds_within_captured`) | Probe | `payment.refunded_amount <= payment.captured_amount`. |
-| **A late, older event does not overwrite newer payment state** (`no_stale_overwrite`) | Probe | Delivering an older event after a newer event for the same payment does not move `payment.status` backward. |
+| **A late, older event does not overwrite newer payment state** (`no_stale_overwrite`) | Probe | Delivering an older event after a newer event for the same payment never moves `payment.status` backward. |
 | **The payment only makes valid state changes** (`valid_state_transition`) | Probe | `payment.status` stays unchanged or makes a valid PayPal lifecycle transition. |
 
-**Verdict rules:**
+**Strict Verdict Rules:**
 - **Failed**: At least one deterministic check failed.
 - **Passed**: Zero checks failed **and** at least one application-state (`probe`) check passed.
-- **Inconclusive**: Zero checks failed, but no application-state check could be evaluated (for example when no state probe is configured). HTTP 2xx responses alone never mark a payment-safety scenario as `Passed`.
+- **Inconclusive**: Zero checks failed, but no application-state check could be evaluated (e.g., no state probe configured). HTTP `2xx` replies alone never produce a `Passed` verdict.
 
-**State Probe Contract (optional, test environments only):**
+### 4. Guardrailed AI Test Engineer
+The AI Test Engineer accelerates reliability testing without compromising deterministic rigor:
+- **Natural-Language Test Planning**: Converts plain-English requests (e.g., *"Test whether my application processes the same completed payment webhook twice"*) into a **validated structured test specification** mapped to Faultline's deterministic assertions and stored verified events.
+- **Evidence-Based Failure Analysis**: Inspects completed or failed execution traces (HTTP status sequences such as `500` on first delivery followed by `200` on retry, probe deltas before/after, and failed assertions) to explain *what happened*, *what was expected*, *where the failure occurred*, *why it matters*, and *how to remediate it*—strictly separating **Directly Observed Facts**, **Assumptions & Blind Spots**, and **Recommendations**.
+- **Integration-Specific Test Suggestions**: Analyzes your project's stored verified events, run history, and unevaluated checks to recommend concrete next tests (such as concurrent duplicate races or stale-overwrite delay tests).
+- **Hard Code-Level Guardrails**:
+  - Cannot fabricate PayPal events or execute scenarios on unverified payloads.
+  - Cannot execute financial operations (`financialOperationsAllowed: false` enforced in `validateTestSpec`).
+  - Cannot invent results or override deterministic verdicts (`enforceAnalysisGuardrails` locks `deterministicVerdict.canOverride = false`).
+  - Has zero access to PayPal secrets, OAuth tokens, encryption keys, or session secrets.
+
+---
+
+## Quickstart & 3-Minute Demo
+
+### Prerequisites
+- **Node.js 22 LTS** (Node.js `>=20` supported)
+- **Windows Command Prompt (`cmd.exe`)** (or any standard terminal)
+- A free [PayPal Developer](https://developer.paypal.com) account (for live Sandbox calls)
+
+### 1. Install & Initialize
+```cmd
+git clone https://github.com/NOBA235/faultline.git
+cd faultline
+npm install
+npm run setup
+npm start
+```
+- `npm run setup` generates `.env` with cryptographically random `ENCRYPTION_KEY`, `SESSION_SECRET`, and `ADMIN_PASSWORD` values and prints your sign-in password to the console.
+- Open **http://127.0.0.1:3000** and sign in with the printed `ADMIN_PASSWORD`.
+
+### 2. Run the Interactive Fault-Injection Demo
+Faultline ships with a standalone demo receiver and state probe (`scripts/demo-receiver.js`) that can run in **`buggy`** mode (non-idempotent, vulnerable to duplicate processing and stale overwrites) or **`idempotent`** mode (properly guarded):
+
+1. **Start the demo receiver in `buggy` mode** (in a second terminal):
+   ```cmd
+   npm run demo-receiver
+   ```
+   *(Or explicitly: `node scripts\demo-receiver.js buggy` — listens on `http://127.0.0.1:4000`)*
+2. **Create a Project in Faultline**:
+   - **Sandbox Client ID & Secret**: From your [PayPal Developer Dashboard](https://developer.paypal.com/dashboard/applications/sandbox)
+   - **Webhook Endpoint URL**: `http://127.0.0.1:4000/webhooks/paypal`
+   - **State Probe URL**: `http://127.0.0.1:4000/faultline-probe`
+3. **Receive a Verified PayPal Webhook**:
+   - Expose port `3000` via an HTTPS tunnel (e.g., `ngrok http 3000`), set `PUBLIC_BASE_URL=https://<your-tunnel>` in `.env`, register the project's **Receiver URL** in your PayPal Sandbox App's Webhooks settings, save the **PayPal Webhook ID** in Faultline, and create/approve/capture a Sandbox order.
+4. **Watch Faultline Catch the Bug**:
+   - Open **AI Test Engineer**, enter:
+     > `Test whether my application processes the same completed payment webhook twice.`
+   - Click **Generate test plan**, then **Execute validated test plan**.
+   - **Result**: Faultline marks the run **Failed**—showing that although your endpoint returned `HTTP 200` on both deliveries, `event.processed_count` and `payment.payment_records` both climbed to `2`.
+   - Click **Analyze with AI Test Engineer** to view the evidence-backed root-cause breakdown and remediation guidance.
+5. **Verify the Fix**:
+   - Restart the demo receiver in `idempotent` mode:
+     ```cmd
+     node scripts\demo-receiver.js idempotent
+     ```
+   - Re-run the scenario in Faultline and watch all deterministic application-state checks **Pass**.
+
+---
+
+## Application State Probe Contract
+
+To let Faultline verify internal financial invariants without coupling to your database engine, expose a test-only `GET` endpoint in your staging/test environment:
 
 ```http
 GET <probe_url>?event_id=WH-...&resource_id=...&event_type=PAYMENT.CAPTURE.COMPLETED
@@ -148,7 +192,9 @@ GET <probe_url>?event_id=WH-...&resource_id=...&event_type=PAYMENT.CAPTURE.COMPL
 
 ```json
 {
-  "event": { "processed_count": 1 },
+  "event": {
+    "processed_count": 1
+  },
   "payment": {
     "status": "COMPLETED",
     "captured_amount": "10.10",
@@ -159,72 +205,65 @@ GET <probe_url>?event_id=WH-...&resource_id=...&event_type=PAYMENT.CAPTURE.COMPL
 }
 ```
 
-### 6. AI Test Engineer
-
-The AI Test Engineer (`src/ai-engineer.js`, `src/ai.js`) supports three evidence-driven workflows:
-
-1. **Natural-Language Test Planning**: Converts plain-English prompts (such as `"Test whether my application processes the same completed payment webhook twice"`) into a validated structured test specification (`objective`, `requiredSourceEvent`, `scenario`, `plannedAttempts`, `expectedBehavior`, `assertions` mapped to `src/checks.js`, `failureConditions`, and `financialOperationsAllowed: false`). Specifications are validated before storage and re-validated before execution.
-2. **Evidence-Based Failure Analysis**: Analyzes completed or failed scenario runs using only the stored execution trace (`scenario_runs`, `forward_attempts`, `assertion_results`, `run_snapshots`, `webhook_events`). Explains what happened, what was expected, what actually happened (including mixed retry sequences such as HTTP 500 followed by HTTP 200), where the failure occurred, why it matters, what to investigate, and concrete remediation steps. Strictly separates **Directly observed facts**, **Assumptions and blind spots**, and **Recommendations**, and flags **Insufficient evidence** whenever internal state could not be observed.
-3. **Integration-Specific Test Suggestions**: Recommends additional tests based on the project's stored verified events, previous scenario runs, and failed or unevaluated checks.
-
-**Enforced AI safety boundaries:**
-- Cannot fabricate PayPal events or run scenarios on unverified deliveries.
-- Cannot directly execute financial operations (creating orders, capturing payments, or issuing refunds).
-- Cannot invent results or override deterministic verdicts (`enforceAnalysisGuardrails` locks `deterministicVerdict.canOverride = false`).
-- Cannot access or reveal PayPal secrets, encryption keys, or session tokens.
-
----
-
-## Requirements
-
-- Windows with Command Prompt (`cmd.exe`)
-- [Node.js 22 LTS](https://nodejs.org/) (Node.js 20+ supported)
-- A free [PayPal Developer](https://developer.paypal.com) account
-
----
-
-## Setup & Running (Windows CMD)
-
-```cmd
-cd c:\Users\User\Downloads\faultline
-npm install
-npm run setup
-npm start
+```javascript
+// Minimal Express example (enable in TEST / STAGING environments only)
+app.get('/faultline-probe', async (req, res) => {
+  const seen = await db.get(
+    'SELECT COUNT(*) AS n FROM processed_webhooks WHERE paypal_event_id = ?',
+    req.query.event_id
+  );
+  const pay = await db.get(
+    'SELECT status, captured, refunded, currency FROM payments WHERE capture_id = ?',
+    req.query.resource_id
+  );
+  const records = await db.get(
+    'SELECT COUNT(*) AS n FROM payments WHERE capture_id = ?',
+    req.query.resource_id
+  );
+  res.json({
+    event: { processed_count: seen.n },
+    payment: pay ? {
+      status: pay.status,
+      captured_amount: pay.captured,
+      refunded_amount: pay.refunded,
+      currency: pay.currency,
+      payment_records: records.n,
+    } : {},
+  });
+});
 ```
 
-- `npm run setup` generates `.env` with cryptographically random `ENCRYPTION_KEY`, `SESSION_SECRET`, and `ADMIN_PASSWORD` values (and prints the admin password to the console). It refuses to overwrite an existing `.env`.
-- Open `http://127.0.0.1:3000` in your browser and sign in with `ADMIN_PASSWORD`.
+---
 
-To run the automated test suite:
+## Security & Engineering Design
+
+- **Envelope Encryption at Rest**: PayPal Sandbox secrets are encrypted using **AES-256-GCM** (`src/crypto.js`) with a 96-bit random IV, 128-bit authentication tag, and the project UUID bound as Additional Authenticated Data (AAD). Secrets are never returned by any API endpoint, never written to logs, and never stored in browser storage.
+- **Session & Origin Hardening**: `HttpOnly`, `SameSite=Strict`, HMAC-SHA256 signed session cookies with IP rate limiting on login, strict `Content-Security-Policy`, and cross-origin write rejection.
+- **Loop & Redirect Protection**: Forwarder and state probe requests block self-referential loops to Faultline's own receiver, refuse to follow HTTP `3xx` redirects, enforce strict request timeouts (`FORWARD_TIMEOUT_MS`), and cap response body reads.
+
+---
+
+## Testing & Verification
+
+Run the full automated test suite (**131 tests** across 13 test files):
 
 ```cmd
 npm test
 ```
 
----
+| Test Suite | Coverage |
+|---|---|
+| `test/paypal.test.js` & `test/orders.test.js` | OAuth2 token exchange, Order creation/refresh/capture, idempotency locks, and error handling |
+| `test/webhooks.test.js` | Byte-exact webhook ingestion, PayPal signature verification states, redelivery deduplication, and forgery rejection |
+| `test/scenarios.test.js` | Baseline forwarding, sequential & concurrent duplicates, delayed delivery timers, deliberate drops, and replays |
+| `test/checks.test.js` & `test/checks-integration.test.js` | All 11 deterministic financial safety checks against idempotent and planted-bug target applications |
+| `test/ai-engineer.test.js` & `test/ai-integration.test.js` | Natural-language test planning, spec validation, execution-trace failure analysis, test suggestions, and AI safety guardrails |
+| `test/reports.test.js` | Overview metrics accuracy, reliability findings, failed assertions, and Markdown/JSON report exports |
+| `test/api.test.js`, `test/crypto.test.js`, `test/config.test.js`, `test/db.test.js` | Authentication, AES-256-GCM tamper detection, configuration validation, and SQLite schema migrations |
 
-## Local Demonstration Path (Windows CMD)
-
-Faultline includes a standalone local webhook receiver and state probe (`scripts/demo-receiver.js`) with switchable `buggy` (non-idempotent, allows stale overwrites) and `idempotent` modes so you can verify end-to-end fault detection locally:
-
-1. **Start Faultline** in Command Prompt window 1:
-   ```cmd
-   npm start
-   ```
-2. **Start the demo receiver in `buggy` mode** in Command Prompt window 2:
-   ```cmd
-   node scripts\demo-receiver.js buggy
-   ```
-   The demo receiver listens on `http://127.0.0.1:4000` and exposes:
-   - Webhook endpoint URL: `http://127.0.0.1:4000/webhooks/paypal`
-   - State probe URL: `http://127.0.0.1:4000/faultline-probe`
-3. **Create a project in Faultline** with your PayPal Sandbox `Client ID` and `Secret`, webhook endpoint `http://127.0.0.1:4000/webhooks/paypal`, and state probe URL `http://127.0.0.1:4000/faultline-probe`.
-4. **Receive a verified PayPal Sandbox webhook** (via an HTTPS tunnel registered in your PayPal Sandbox app settings) and open **AI Test Engineer** or **Test Lab**.
-5. **Run a Duplicate Delivery (x2 or x3) scenario**:
-   - In `buggy` mode, the run verdict is **Failed** because `event.processed_count` and `payment.payment_records` increase with every duplicate delivery.
-   - Select **Analyze with AI Test Engineer** on the run to inspect the evidence-backed failure breakdown and remediation guidance.
-6. **Verify the fix in `idempotent` mode**:
-   - Restart the demo receiver in idempotent mode (`Ctrl+C`, then `node scripts\demo-receiver.js idempotent`), re-run the duplicate delivery scenario, and observe that all application-state checks **Pass**.
+### Transparent Disclosure on Test Environments
+- **Automated Fixture Tests (`[fixture]`)**: Automated tests in `test/` use controllable local HTTP stand-in servers (`support/fixtures.js`) for PayPal and the target application so the suite runs deterministically offline.
+- **Live PayPal Sandbox Operations**: Connecting to the live `https://api-m.sandbox.paypal.com` APIs and receiving live PayPal webhooks requires your own PayPal Sandbox `Client ID`, `Secret`, `Webhook ID`, and an HTTPS tunnel for inbound webhook delivery.
 
 ---
 
@@ -232,41 +271,51 @@ Faultline includes a standalone local webhook receiver and state probe (`scripts
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `ENCRYPTION_KEY` | Yes | — | 64 hex characters (32 bytes). Encrypts stored PayPal Sandbox secrets with AES-256-GCM. |
-| `SESSION_SECRET` | Yes | — | At least 32 characters. Signs the `HttpOnly` authentication cookie. |
+| `ENCRYPTION_KEY` | Yes | — | 64 hex characters (32 bytes). Master key for AES-256-GCM encryption of PayPal secrets. |
+| `SESSION_SECRET` | Yes | — | At least 32 characters. Signs the `HttpOnly` session cookie. |
 | `ADMIN_PASSWORD` | Yes | — | At least 12 characters. Password for signing in to the Faultline UI. |
 | `PORT` | No | `3000` | HTTP server port (`1`–`65535`). |
-| `HOST` | No | `127.0.0.1` | Bind address. Keep on localhost unless behind an HTTPS reverse proxy. |
+| `HOST` | No | `127.0.0.1` | Bind address. |
 | `DATABASE_PATH` | No | `data/faultline.db` | Path to the SQLite database file. |
-| `PAYPAL_TIMEOUT_MS` | No | `10000` | Timeout in milliseconds for outbound requests to PayPal Sandbox (`1000`–`60000`). |
-| `FORWARD_TIMEOUT_MS` | No | `10000` | Timeout in milliseconds when forwarding webhooks or querying your state probe (`1000`–`60000`). |
-| `PROBE_SETTLE_MS` | No | `500` | Wait time in milliseconds after the final delivery attempt before reading the post-run state probe (`0`–`10000`). |
-| `PUBLIC_BASE_URL` | No | `http://HOST:PORT` | Public base URL used for PayPal approval return links and displayed webhook receiver URLs. |
+| `PUBLIC_BASE_URL` | No | `http://HOST:PORT` | Public base URL used for PayPal return links and displayed webhook receiver URLs. |
+| `PAYPAL_TIMEOUT_MS` | No | `10000` | Timeout (ms) for requests to PayPal Sandbox (`1000`–`60000`). |
+| `FORWARD_TIMEOUT_MS` | No | `10000` | Timeout (ms) when forwarding webhooks or querying the state probe (`1000`–`60000`). |
+| `PROBE_SETTLE_MS` | No | `500` | Wait time (ms) after the final delivery attempt before reading the post-run state probe (`0`–`10000`). |
 | `COOKIE_SECURE` | No | `false` | Set to `true` when serving Faultline over HTTPS. |
 
 ---
 
-## Verification & Truthful Limitations
-
-### What Was Verified
-- **Automated Test Suite (`npm test`)**: **131 automated tests pass** across `test/api.test.js`, `test/paypal.test.js`, `test/orders.test.js`, `test/webhooks.test.js`, `test/scenarios.test.js`, `test/checks.test.js`, `test/checks-integration.test.js`, `test/reports.test.js`, `test/ai-engineer.test.js`, `test/ai-integration.test.js`, `test/crypto.test.js`, `test/config.test.js`, and `test/db.test.js`.
-- Verified capabilities include: AES-256-GCM secret encryption and redaction, PayPal OAuth2 token validation, order creation/refresh/capture and capture lookup, raw-byte webhook ingestion and PayPal signature verification, baseline forwarding, duplicate/delayed/dropped/replay fault injection, all 11 deterministic financial safety checks, Markdown/JSON evidence exports, natural-language test planning, evidence-based failure analysis, test suggestions, and AI safety guardrails.
-
-### What Requires External Credentials / Live Sandbox Activity
-- **Automated tests use local stand-in servers (`[fixture]`)**: No automated test contacts the live `https://api-m.sandbox.paypal.com` servers or receives a live webhook from PayPal. Live PayPal Sandbox verification requires your own PayPal Sandbox `Client ID`, `Secret`, `Webhook ID`, and a public HTTPS tunnel.
-- **Buyer approval is an interactive browser step**: Approving a newly created Sandbox order on PayPal's checkout page requires signing in with a PayPal Sandbox buyer account in your browser.
-- **Delayed and replayed webhook timestamps**: Faultline preserves PayPal's original `paypal-transmission-time` header so signature verification remains valid. If your receiving application enforces a strict timestamp freshness window, it may reject delayed or replayed deliveries; Faultline records and reports that rejection honestly.
-
----
-
-## Repository Layout
+## Repository Structure
 
 ```text
-src/       Express app, PayPal Sandbox client & service, webhooks, forwarder, scenarios,
-           deterministic checks, state probe, evidence snapshots, reports, AI Test Engineer,
-           AES-256-GCM crypto, config validation, and SQLite database migrations
-public/    Frontend web application (vanilla HTML, CSS, and JavaScript; zero build step)
-scripts/   Environment generator (setup-env.js) and local demo receiver (demo-receiver.js)
-support/   Controllable PayPal Sandbox and target-application test fixtures
-test/      Automated unit and end-to-end integration test suites
+faultline/
+├── src/
+│   ├── server.js          # HTTP server entrypoint & graceful shutdown
+│   ├── app.js             # Express application, auth, CSP, and project routes
+│   ├── paypal.js          # PayPal Sandbox REST API client (OAuth2, Orders, Captures, Verify)
+│   ├── paypal-service.js  # Token caching, 401 retry, and API call logging
+│   ├── orders.js          # Sandbox order creation, refresh, and capture routes
+│   ├── webhooks.js        # Raw-byte webhook receiver, signature verification, and explorer API
+│   ├── forwarder.js       # Fault-injection execution engine (forward, duplicate, delay, drop, replay)
+│   ├── scenarios.js       # Scenario validation and run inspection routes
+│   ├── checks.js          # 11 deterministic financial safety invariant checks
+│   ├── probe.js           # Application state probe client & response normalizer
+│   ├── evidence.js        # Pre/post-run probe and PayPal order snapshot collector
+│   ├── ai-engineer.js     # Natural-language planner, trace analyzer, recommender & guardrails
+│   ├── ai.js              # AI Test Engineer REST endpoints
+│   ├── reports.js         # Overview metrics, findings, failed assertions & Markdown/JSON exports
+│   ├── crypto.js          # AES-256-GCM cipher, HMAC token signing & constant-time compare
+│   ├── db.js              # SQLite connection & schema migrations
+│   └── config.js          # Environment variable validation
+├── public/
+│   ├── index.html         # Single-page developer workbench shell
+│   ├── app.js             # Zero-dependency frontend UI
+│   ├── app.css            # Light-mode observability dashboard stylesheet
+│   └── paypal-return.html # Buyer approval return landing page
+├── scripts/
+│   ├── setup-env.js       # Generates .env with random cryptographic keys
+│   └── demo-receiver.js   # Standalone demo webhook receiver & state probe (buggy / idempotent)
+├── support/
+│   └── fixtures.js        # Controllable PayPal Sandbox & target app stand-ins for automated tests
+└── test/                  # 131 automated unit and integration tests
 ```
