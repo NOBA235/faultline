@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" role="img" aria-labelledby="title">
+  <title id="title">Faultline mark</title>
+  <defs>
+    <linearGradient id="faultline-gradient" x1="7" y1="5" x2="42" y2="43" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ff5638" />
+      <stop offset="1" stop-color="#c91d27" />
+    </linearGradient>
+  </defs>
+  <path fill="url(#faultline-gradient)" d="M24 2.5 43.5 13.75v20.5L24 45.5 4.5 34.25v-20.5L24 2.5Z" />
+  <path fill="#090909" d="m27.4 7.5-13 17.7h8.2L21 40.5 34.1 21h-8.2l1.5-13.5Z" />
+</svg>

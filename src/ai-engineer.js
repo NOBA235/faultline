@@ -913,6 +913,507 @@ function suggestTests(evidence) {
   };
 }
 
+// ---- Data Minimization, Prompt Sanitization & Strict Model Validation -------
+
+function redactSensitiveText(value) {
+  if (typeof value !== 'string') return '';
+  return value
+    // Strip ASCII control characters except tab/newline
+    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, ' ')
+    // Redact Authorization headers / tokens
+    .replace(/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{6,}/gi, '$1 [REDACTED_TOKEN]')
+    // Redact OpenAI-style keys, fixture tokens/secrets, or long hex keys (32+ chars)
+    .replace(/\bsk-[A-Za-z0-9_-]{12,}\b/g, '[REDACTED_KEY]')
+    .replace(/\bfixture-(?:token|good-secret|wrong-secret)-[A-Za-z0-9_-]+\b/gi, '[REDACTED_SECRET]')
+    .replace(/\b[0-9a-fA-F]{40,}\b/g, '[REDACTED_HEX]')
+    // Redact email addresses (buyer PII)
+    .replace(/\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/g, '[REDACTED_EMAIL]')
+    .trim();
+}
+
+function sanitizePromptInput(prompt) {
+  if (typeof prompt !== 'string' || prompt.trim().length < 5) {
+    throw new ApiError(400, 'invalid_prompt', 'Enter a plain-English description of the webhook reliability test you want to plan (at least 5 characters).');
+  }
+  if (prompt.length > 500) {
+    throw new ApiError(400, 'invalid_prompt', 'Keep the test request under 500 characters.');
+  }
+  const clean = redactSensitiveText(prompt);
+  const forbidden = checkForbiddenIntent(clean);
+  if (forbidden) {
+    throw new ApiError(422, 'unsafe_request', forbidden);
+  }
+  return clean;
+}
+
+// Allow-lists only the minimum event metadata needed for AI test planning.
+// Never includes raw_body, headers_json, resource_id, secrets, tokens, or buyer PII.
+function sanitizeEventsForAi(verifiedEvents = [], { selectedEventId = null, probeConfigured = false } = {}) {
+  const safeEvents = (Array.isArray(verifiedEvents) ? verifiedEvents : []).slice(0, 25).map((e) => ({
+    id: String(e.id || ''),
+    paypalEventId: redactSensitiveText(String(e.paypal_event_id || '')),
+    eventType: redactSensitiveText(String(e.event_type || '')),
+    resourceType: redactSensitiveText(String(e.resource_type || '')),
+    paypalEventCreatedAt: e.paypal_event_created_at || null,
+    processingStatus: e.processing_status || 'stored',
+  }));
+  return {
+    selectedEventId: selectedEventId ? String(selectedEventId) : null,
+    probeConfigured: Boolean(probeConfigured),
+    verifiedEvents: safeEvents,
+  };
+}
+
+// Allow-lists only sanitized execution trace metadata for AI run explanation.
+// Never includes raw webhook payloads, HTTP headers, response body snippets, destination URLs, or credentials.
+function sanitizeTraceForAi(trace) {
+  if (!trace || !trace.run || !trace.event) {
+    throw new ApiError(400, 'missing_trace', 'Cannot analyze a scenario run without its execution trace.');
+  }
+  const { run, event, attempts = [], assertions = [], snapshots = [], probeConfigured = false, probeSettleMs = 500 } = trace;
+  return {
+    run: {
+      id: String(run.id || ''),
+      kind: String(run.kind || ''),
+      label: String(run.label || ''),
+      status: String(run.status || ''),
+      plannedAttempts: Number(run.plannedAttempts || 1),
+      params: run.params && typeof run.params === 'object' ? {
+        ...(run.params.count !== undefined ? { count: Number(run.params.count) } : {}),
+        ...(run.params.mode !== undefined ? { mode: String(run.params.mode) } : {}),
+        ...(run.params.delaySeconds !== undefined ? { delaySeconds: Number(run.params.delaySeconds) } : {}),
+      } : {},
+      verdict: run.verdict || null,
+      verdictReason: redactSensitiveText(String(run.verdictReason || '')).slice(0, 300),
+    },
+    event: {
+      id: String(event.id || ''),
+      paypalEventId: redactSensitiveText(String(event.paypalEventId || '')),
+      eventType: redactSensitiveText(String(event.eventType || '')),
+      resourceType: redactSensitiveText(String(event.resourceType || '')),
+      verificationStatus: String(event.verificationStatus || ''),
+      processingStatus: String(event.processingStatus || ''),
+    },
+    attempts: (Array.isArray(attempts) ? attempts : []).slice(0, 20).map((a) => ({
+      attemptNo: Number(a.attemptNo),
+      deliveryKind: String(a.deliveryKind || ''),
+      outcome: String(a.outcome || ''),
+      httpStatus: typeof a.httpStatus === 'number' ? a.httpStatus : null,
+      durationMs: typeof a.durationMs === 'number' ? a.durationMs : null,
+    })),
+    assertions: (Array.isArray(assertions) ? assertions : []).slice(0, 20).map((a) => ({
+      id: String(a.id || ''),
+      category: String(a.category || ''),
+      name: String(a.name || ''),
+      verdict: String(a.verdict || ''),
+      summary: redactSensitiveText(String(a.summary || '')).slice(0, 300),
+    })),
+    snapshots: (Array.isArray(snapshots) ? snapshots : []).slice(0, 10).map((s) => ({
+      source: String(s.source || ''),
+      phase: String(s.phase || ''),
+      outcome: String(s.outcome || ''),
+      data: s.data && typeof s.data === 'object' ? {
+        processedCount: typeof s.data.processedCount === 'number' ? s.data.processedCount : null,
+        status: typeof s.data.status === 'string' ? redactSensitiveText(s.data.status).slice(0, 40) : null,
+        paymentRecords: typeof s.data.paymentRecords === 'number' ? s.data.paymentRecords : null,
+        capturedCents: typeof s.data.capturedCents === 'number' ? s.data.capturedCents : null,
+        refundedCents: typeof s.data.refundedCents === 'number' ? s.data.refundedCents : null,
+        orderStatus: typeof s.data.orderStatus === 'string' ? redactSensitiveText(s.data.orderStatus).slice(0, 40) : null,
+        captureCount: typeof s.data.captureCount === 'number' ? s.data.captureCount : null,
+      } : null,
+    })),
+    probeConfigured: Boolean(probeConfigured),
+    probeSettleMs: Number(probeSettleMs || 500),
+  };
+}
+
+// Allow-lists only sanitized project metadata for AI follow-up test suggestions.
+function sanitizeEvidenceForAi(evidence = {}) {
+  const {
+    project = {},
+    verifiedEvents = [],
+    runs = [],
+    failedAssertions = [],
+    neverEvaluatedChecks = [],
+  } = evidence || {};
+
+  return {
+    probeConfigured: Boolean(project.probeUrl),
+    webhookIdConfigured: Boolean(project.paypalWebhookId),
+    forwardMode: String(project.forwardMode || 'manual'),
+    verifiedEvents: (Array.isArray(verifiedEvents) ? verifiedEvents : []).slice(0, 25).map((e) => ({
+      id: String(e.id || ''),
+      paypalEventId: redactSensitiveText(String(e.paypal_event_id || '')),
+      eventType: redactSensitiveText(String(e.event_type || '')),
+      resourceType: redactSensitiveText(String(e.resource_type || '')),
+      paypalEventCreatedAt: e.paypal_event_created_at || null,
+      processingStatus: String(e.processing_status || 'stored'),
+      hasRelatedOrder: Boolean(e.related_order_id),
+    })),
+    runs: (Array.isArray(runs) ? runs : []).slice(0, 30).map((r) => ({
+      id: String(r.id || '').slice(0, 12),
+      eventId: String(r.event_id || ''),
+      kind: String(r.kind || ''),
+      params: r.params && typeof r.params === 'object' ? {
+        ...(r.params.count !== undefined ? { count: Number(r.params.count) } : {}),
+        ...(r.params.mode !== undefined ? { mode: String(r.params.mode) } : {}),
+        ...(r.params.delaySeconds !== undefined ? { delaySeconds: Number(r.params.delaySeconds) } : {}),
+      } : {},
+      status: String(r.status || ''),
+      verdict: r.verdict || null,
+    })),
+    failedAssertions: (Array.isArray(failedAssertions) ? failedAssertions : []).slice(0, 20).map((f) => ({
+      runId: String(f.run_id || '').slice(0, 12),
+      eventId: String(f.event_id || ''),
+      checkId: String(f.check_id || ''),
+      name: String(f.name || ''),
+      summary: redactSensitiveText(String(f.summary || '')).slice(0, 240),
+    })),
+    neverEvaluatedChecks: (Array.isArray(neverEvaluatedChecks) ? neverEvaluatedChecks : []).slice(0, 20).map((c) => ({
+      checkId: String(c.check_id || ''),
+      name: String(c.name || ''),
+    })),
+  };
+}
+
+// Validates and normalizes the OpenAI model's structured test plan response against strict schemas and Faultline rules.
+function buildPlanFromModelOutput(rawModelOutput, ctx = {}) {
+  if (!rawModelOutput || typeof rawModelOutput !== 'object' || Array.isArray(rawModelOutput)) {
+    throw new ApiError(502, 'ai_invalid_output', 'The AI model response was not a valid JSON object.');
+  }
+
+  if (typeof rawModelOutput.refusal === 'string' && rawModelOutput.refusal.trim()) {
+    throw new ApiError(422, 'unsafe_request', redactSensitiveText(rawModelOutput.refusal.trim()).slice(0, 400));
+  }
+
+  // Reject any forbidden financial / verification / verdict override keys
+  const forbiddenFlags = ['createOrder', 'captureOrder', 'refundPayment', 'initiatePayment', 'executeNow', 'overrideVerdict', 'fabricateEvent', 'markVerified'];
+  for (const key of forbiddenFlags) {
+    if (rawModelOutput[key]) {
+      throw new ApiError(502, 'ai_invalid_output', `Model output included forbidden operation "${key}" and was rejected.`);
+    }
+  }
+  if (rawModelOutput.financialOperationsAllowed !== false) {
+    throw new ApiError(502, 'ai_invalid_output', 'Model output must explicitly set financialOperationsAllowed to false.');
+  }
+  if (rawModelOutput.requiredVerificationStatus !== undefined && rawModelOutput.requiredVerificationStatus !== 'verified') {
+    throw new ApiError(502, 'ai_invalid_output', 'Model output attempted to allow non-verified events and was rejected.');
+  }
+
+  if (!rawModelOutput.scenario || typeof rawModelOutput.scenario !== 'object' || Array.isArray(rawModelOutput.scenario)) {
+    throw new ApiError(502, 'ai_invalid_output', 'Model output is missing a valid scenario object.');
+  }
+  const rawKind = rawModelOutput.scenario.kind;
+  if (typeof rawKind !== 'string' || !KINDS.includes(rawKind)) {
+    throw new ApiError(502, 'ai_invalid_output', `Model returned unsupported scenario kind "${rawKind}". Allowed kinds: ${KINDS.join(', ')}.`);
+  }
+
+  let parsedScenario;
+  try {
+    parsedScenario = parseScenarioInput({
+      kind: rawKind,
+      ...(rawModelOutput.scenario.params && typeof rawModelOutput.scenario.params === 'object' ? rawModelOutput.scenario.params : {}),
+    });
+  } catch (err) {
+    throw new ApiError(502, 'ai_invalid_output', `Model returned invalid scenario parameters: ${(err && err.message) || 'invalid parameters'}`);
+  }
+
+  const kind = parsedScenario.kind;
+  const params = parsedScenario.params;
+
+  const rawEventType = typeof rawModelOutput.requiredEventType === 'string'
+    ? rawModelOutput.requiredEventType.trim().toUpperCase()
+    : (rawModelOutput.requiredSourceEvent && typeof rawModelOutput.requiredSourceEvent.eventType === 'string'
+      ? rawModelOutput.requiredSourceEvent.eventType.trim().toUpperCase()
+      : '');
+  if (!/^[A-Z0-9._]{5,60}$/.test(rawEventType)) {
+    throw new ApiError(502, 'ai_invalid_output', 'Model output is missing a valid PayPal event type (for example PAYMENT.CAPTURE.COMPLETED).');
+  }
+
+  const objective = typeof rawModelOutput.objective === 'string' ? redactSensitiveText(rawModelOutput.objective).slice(0, 400) : '';
+  const expectedBehavior = typeof rawModelOutput.expectedBehavior === 'string' ? redactSensitiveText(rawModelOutput.expectedBehavior).slice(0, 500) : '';
+  if (objective.length < 10 || expectedBehavior.length < 10) {
+    throw new ApiError(502, 'ai_invalid_output', 'Model output is missing a complete objective or expectedBehavior description.');
+  }
+  if (checkForbiddenIntent(objective) || checkForbiddenIntent(expectedBehavior)) {
+    throw new ApiError(502, 'ai_invalid_output', 'Model output violated safety boundaries and was rejected.');
+  }
+
+  if (!Array.isArray(rawModelOutput.assertions) || rawModelOutput.assertions.length === 0 || rawModelOutput.assertions.length > 15) {
+    throw new ApiError(502, 'ai_invalid_output', 'Model output must include a non-empty array of deterministic assertions.');
+  }
+  const assertionIds = [];
+  for (const item of rawModelOutput.assertions) {
+    const checkId = typeof item === 'string' ? item : (item && typeof item === 'object' ? item.id : '');
+    if (typeof checkId !== 'string' || !KNOWN_CHECKS[checkId]) {
+      throw new ApiError(502, 'ai_invalid_output', `Model proposed unknown or non-deterministic check ID "${checkId}". Only checks in src/checks.js are allowed.`);
+    }
+    if (!assertionIds.includes(checkId)) assertionIds.push(checkId);
+  }
+
+  if (!Array.isArray(rawModelOutput.failureConditions) || rawModelOutput.failureConditions.length === 0 || rawModelOutput.failureConditions.length > 12) {
+    throw new ApiError(502, 'ai_invalid_output', 'Model output must include a non-empty array of failureConditions.');
+  }
+  const failureConditions = rawModelOutput.failureConditions
+    .map((c) => (typeof c === 'string' ? redactSensitiveText(c).slice(0, 300) : ''))
+    .filter((c) => c.length >= 5);
+  if (failureConditions.length === 0) {
+    throw new ApiError(502, 'ai_invalid_output', 'Model output failureConditions must contain valid descriptions.');
+  }
+  if (!ctx.probeConfigured && !failureConditions.some((c) => /state probe/i.test(c))) {
+    failureConditions.push('Note: No state probe is currently configured on this project. Without a probe, application-state checks will be marked "not_evaluable" and the overall run verdict will be "inconclusive" even if your endpoint returns HTTP 200.');
+  }
+
+  const verifiedEvents = Array.isArray(ctx.verifiedEvents) ? ctx.verifiedEvents : [];
+  let matched = null;
+  let eventType = rawEventType;
+
+  if (ctx.selectedEventId) {
+    matched = verifiedEvents.find((e) => e.id === ctx.selectedEventId) || null;
+    if (!matched) {
+      throw new ApiError(404, 'not_found', 'Selected webhook event was not found among verified events in this project.');
+    }
+    if (matched.event_type) eventType = matched.event_type;
+  } else if (rawModelOutput.matchedEventId !== undefined && rawModelOutput.matchedEventId !== null && rawModelOutput.matchedEventId !== '') {
+    if (typeof rawModelOutput.matchedEventId !== 'string') {
+      throw new ApiError(502, 'ai_invalid_output', 'Model matchedEventId must be a string or null.');
+    }
+    matched = verifiedEvents.find(
+      (e) => e.id === rawModelOutput.matchedEventId || e.paypal_event_id === rawModelOutput.matchedEventId
+    ) || null;
+    if (!matched) {
+      throw new ApiError(502, 'ai_invalid_output', `Model referenced event "${rawModelOutput.matchedEventId}" which is not a PayPal-verified event in this project.`);
+    }
+    if (matched.event_type) eventType = matched.event_type;
+  } else {
+    matched = verifiedEvents.find((e) => e.event_type === eventType) || null;
+  }
+
+  const plannedAttempts = kind === 'duplicate' ? params.count : 1;
+  const requestsToSend = kind === 'drop' ? 0 : plannedAttempts;
+
+  const spec = {
+    specVersion: 1,
+    prompt: typeof ctx.prompt === 'string' ? ctx.prompt : '',
+    objective,
+    requiredSourceEvent: {
+      eventType,
+      paypalEventId: matched ? matched.paypal_event_id : null,
+      verificationRequired: 'verified',
+      description: `A genuine PayPal Sandbox ${eventType} webhook verified by PayPal's signature verification API.`,
+      matchedEvent: matched ? {
+        id: matched.id,
+        paypalEventId: matched.paypal_event_id,
+        eventType: matched.event_type,
+        resourceId: matched.resource_id,
+        receivedAt: matched.first_received_at,
+      } : null,
+      availabilityNote: matched
+        ? `Matched stored verified event ${matched.paypal_event_id || matched.id} (received ${matched.first_received_at}).`
+        : verifiedEvents.length
+          ? `No verified ${eventType} event is stored yet (${verifiedEvents.length} other verified event(s) exist in this project). Select an existing verified event or receive a ${eventType} webhook from PayPal Sandbox before running.`
+          : 'No PayPal-verified webhook events are stored in this project yet. Receive a real webhook from PayPal Sandbox before executing this plan.',
+    },
+    scenario: {
+      kind,
+      label: SCENARIO_LABELS[kind],
+      params,
+    },
+    plannedAttempts,
+    requestsToSend,
+    expectedBehavior,
+    assertions: assertionIds.map((id) => ({ ...KNOWN_CHECKS[id], expectedVerdict: 'pass' })),
+    failureConditions,
+    financialOperationsAllowed: false,
+    safetyNotice: 'Executing this plan only forwards or withholds a stored PayPal-verified webhook to your configured test endpoint. It never creates, captures, or refunds a PayPal payment, and deterministic checks alone decide the verdict.',
+  };
+
+  const validation = validateTestSpec(spec);
+  if (!validation.valid) {
+    throw new ApiError(502, 'ai_invalid_output', `The AI-generated test plan failed Faultline specification validation: ${validation.errors.join(' ')}`);
+  }
+
+  return {
+    spec,
+    validation,
+    matchedEventId: matched ? matched.id : null,
+  };
+}
+
+// Validates the OpenAI model's run analysis response and locks all deterministic verdicts and ground-truth observations.
+function buildAnalysisFromModelOutput(rawModelOutput, trace) {
+  if (!rawModelOutput || typeof rawModelOutput !== 'object' || Array.isArray(rawModelOutput)) {
+    throw new ApiError(502, 'ai_invalid_output', 'The AI model analysis response was not a valid JSON object.');
+  }
+
+  // Reject any attempt to override the deterministic verdict or initiate financial operations
+  if (rawModelOutput.overrideVerdict || rawModelOutput.financialOperationsAllowed === true) {
+    throw new ApiError(502, 'ai_invalid_output', 'Model analysis attempted to override a deterministic verdict or allow financial operations and was rejected.');
+  }
+  const actualVerdict = (trace && trace.run && trace.run.verdict) || 'not_evaluated';
+  if (rawModelOutput.deterministicVerdict && typeof rawModelOutput.deterministicVerdict === 'object') {
+    if (rawModelOutput.deterministicVerdict.canOverride === true) {
+      throw new ApiError(502, 'ai_invalid_output', 'Model analysis attempted to mark deterministicVerdict as overridable and was rejected.');
+    }
+    if (
+      typeof rawModelOutput.deterministicVerdict.status === 'string' &&
+      rawModelOutput.deterministicVerdict.status !== actualVerdict
+    ) {
+      throw new ApiError(
+        502,
+        'ai_invalid_output',
+        `Model analysis attempted to change deterministic verdict from "${actualVerdict}" to "${rawModelOutput.deterministicVerdict.status}" and was rejected.`
+      );
+    }
+  }
+  if (typeof rawModelOutput.verdict === 'string' && rawModelOutput.verdict !== actualVerdict) {
+    throw new ApiError(
+      502,
+      'ai_invalid_output',
+      `Model analysis attempted to override deterministic verdict "${actualVerdict}" with "${rawModelOutput.verdict}".`
+    );
+  }
+
+  const requiredFields = ['whatWasExpected', 'whereFailureOccurred', 'whyItMatters', 'whatToInvestigate', 'remediation'];
+  const sanitized = {};
+  for (const field of requiredFields) {
+    const val = rawModelOutput[field];
+    if (typeof val !== 'string' || redactSensitiveText(val).length < 10) {
+      throw new ApiError(502, 'ai_invalid_output', `Model analysis output is missing a valid "${field}" explanation.`);
+    }
+    sanitized[field] = redactSensitiveText(val).slice(0, 2000);
+  }
+
+  if (!Array.isArray(rawModelOutput.recommendations) || rawModelOutput.recommendations.length === 0 || rawModelOutput.recommendations.length > 10) {
+    throw new ApiError(502, 'ai_invalid_output', 'Model analysis output must include 1 to 10 concrete recommendations.');
+  }
+  const recommendations = rawModelOutput.recommendations
+    .map((r) => (typeof r === 'string' ? redactSensitiveText(r).slice(0, 400) : ''))
+    .filter((r) => r.length >= 5);
+  if (recommendations.length === 0) {
+    throw new ApiError(502, 'ai_invalid_output', 'Model analysis recommendations must contain valid actionable strings.');
+  }
+
+  const guarded = enforceAnalysisGuardrails(sanitized, trace);
+  return {
+    ...guarded,
+    recommendations,
+  };
+}
+
+// Validates the OpenAI model's follow-up test suggestions against stored verified events, scenarios, and deterministic checks.
+function buildSuggestionsFromModelOutput(rawModelOutput, evidence = {}) {
+  if (!rawModelOutput || typeof rawModelOutput !== 'object' || Array.isArray(rawModelOutput)) {
+    throw new ApiError(502, 'ai_invalid_output', 'The AI model suggestions response was not a valid JSON object.');
+  }
+
+  const verifiedEvents = Array.isArray(evidence.verifiedEvents) ? evidence.verifiedEvents : [];
+  const unverifiedEvents = Array.isArray(evidence.unverifiedEvents) ? evidence.unverifiedEvents : [];
+  const runs = Array.isArray(evidence.runs) ? evidence.runs : [];
+  const failedAssertions = Array.isArray(evidence.failedAssertions) ? evidence.failedAssertions : [];
+
+  if (typeof rawModelOutput.summary !== 'string' || redactSensitiveText(rawModelOutput.summary).length < 10) {
+    throw new ApiError(502, 'ai_invalid_output', 'Model suggestions output is missing a valid summary.');
+  }
+  if (!Array.isArray(rawModelOutput.suggestions) || rawModelOutput.suggestions.length > 10) {
+    throw new ApiError(502, 'ai_invalid_output', 'Model suggestions output must contain a suggestions array (up to 10 items).');
+  }
+
+  const validatedSuggestions = [];
+  for (let i = 0; i < rawModelOutput.suggestions.length; i++) {
+    const item = rawModelOutput.suggestions[i];
+    if (!item || typeof item !== 'object' || Array.isArray(item)) {
+      throw new ApiError(502, 'ai_invalid_output', `Suggestion at index ${i} is not a valid object.`);
+    }
+    const priority = typeof item.priority === 'string' ? item.priority.toLowerCase() : '';
+    if (!['high', 'medium', 'low'].includes(priority)) {
+      throw new ApiError(502, 'ai_invalid_output', `Suggestion at index ${i} has invalid priority "${item.priority}".`);
+    }
+    const title = typeof item.title === 'string' ? redactSensitiveText(item.title).slice(0, 200) : '';
+    const rationale = typeof item.rationale === 'string' ? redactSensitiveText(item.rationale).slice(0, 600) : '';
+    if (title.length < 8 || rationale.length < 10) {
+      throw new ApiError(502, 'ai_invalid_output', `Suggestion at index ${i} is missing a valid title or rationale.`);
+    }
+
+    const ev = verifiedEvents.find((e) => e.id === item.eventId || e.paypal_event_id === item.eventId);
+    if (!ev) {
+      throw new ApiError(502, 'ai_invalid_output', `Suggestion at index ${i} referenced event "${item.eventId}" which is not a PayPal-verified event in this project.`);
+    }
+
+    if (!item.scenario || typeof item.scenario !== 'object' || !KINDS.includes(item.scenario.kind)) {
+      throw new ApiError(502, 'ai_invalid_output', `Suggestion at index ${i} has an unsupported scenario kind.`);
+    }
+    let parsedScenario;
+    try {
+      parsedScenario = parseScenarioInput({
+        kind: item.scenario.kind,
+        ...(item.scenario.params && typeof item.scenario.params === 'object' ? item.scenario.params : {}),
+      });
+    } catch (err) {
+      throw new ApiError(502, 'ai_invalid_output', `Suggestion at index ${i} has invalid scenario parameters: ${(err && err.message) || 'invalid'}`);
+    }
+
+    if (!Array.isArray(item.targetChecks) || item.targetChecks.length === 0 || item.targetChecks.length > 11) {
+      throw new ApiError(502, 'ai_invalid_output', `Suggestion at index ${i} must include 1 to 11 targetChecks.`);
+    }
+    const targetChecks = [];
+    for (const cid of item.targetChecks) {
+      if (typeof cid !== 'string' || !KNOWN_CHECKS[cid]) {
+        throw new ApiError(502, 'ai_invalid_output', `Suggestion at index ${i} referenced unknown check ID "${cid}".`);
+      }
+      if (!targetChecks.includes(cid)) targetChecks.push(cid);
+    }
+
+    const basedOn = Array.isArray(item.basedOn)
+      ? item.basedOn.map((b) => (typeof b === 'string' ? redactSensitiveText(b).slice(0, 240) : '')).filter(Boolean).slice(0, 5)
+      : [`Stored verified event ${ev.paypal_event_id} (${ev.event_type})`];
+
+    const candidate = {
+      id: typeof item.id === 'string' && /^[A-Za-z0-9_-]{3,80}$/.test(item.id) ? item.id : `ai-sug-${i + 1}-${ev.id.slice(0, 8)}`,
+      priority,
+      title,
+      rationale,
+      basedOn: basedOn.length ? basedOn : [`Stored verified event ${ev.paypal_event_id} (${ev.event_type})`],
+      eventId: ev.id,
+      paypalEventId: ev.paypal_event_id,
+      eventType: ev.event_type || 'PAYMENT.CAPTURE.COMPLETED',
+      scenario: {
+        kind: parsedScenario.kind,
+        label: SCENARIO_LABELS[parsedScenario.kind],
+        params: parsedScenario.params,
+      },
+      targetChecks,
+    };
+
+    const specCheck = validateTestSpec({
+      objective: candidate.title,
+      requiredSourceEvent: { eventType: candidate.eventType, verificationRequired: 'verified' },
+      scenario: candidate.scenario,
+      plannedAttempts: candidate.scenario.kind === 'duplicate' ? candidate.scenario.params.count : 1,
+      expectedBehavior: candidate.rationale,
+      assertions: candidate.targetChecks.map((id) => ({ id })),
+      failureConditions: ['Deterministic check fails'],
+      financialOperationsAllowed: false,
+    });
+    if (!specCheck.valid) {
+      throw new ApiError(502, 'ai_invalid_output', `Suggestion at index ${i} failed test specification validation: ${specCheck.errors.join(' ')}`);
+    }
+    validatedSuggestions.push(candidate);
+  }
+
+  return {
+    insufficientEvidence: verifiedEvents.length === 0,
+    summary: redactSensitiveText(rawModelOutput.summary).slice(0, 600),
+    basedOnCounts: {
+      verifiedEvents: verifiedEvents.length,
+      unverifiedEvents: unverifiedEvents.length,
+      scenarioRuns: runs.length,
+      failedChecks: failedAssertions.length,
+    },
+    suggestions: validatedSuggestions.slice(0, 8),
+  };
+}
+
 module.exports = {
   KNOWN_CHECKS,
   SCENARIO_LABELS,
@@ -922,4 +1423,12 @@ module.exports = {
   enforceAnalysisGuardrails,
   suggestTests,
   checkForbiddenIntent,
+  redactSensitiveText,
+  sanitizePromptInput,
+  sanitizeEventsForAi,
+  sanitizeTraceForAi,
+  sanitizeEvidenceForAi,
+  buildPlanFromModelOutput,
+  buildAnalysisFromModelOutput,
+  buildSuggestionsFromModelOutput,
 };

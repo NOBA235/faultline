@@ -9,7 +9,16 @@ const {
   analyzeRun,
   enforceAnalysisGuardrails,
   suggestTests,
+  redactSensitiveText,
+  sanitizePromptInput,
+  sanitizeEventsForAi,
+  sanitizeTraceForAi,
+  sanitizeEvidenceForAi,
+  buildPlanFromModelOutput,
+  buildAnalysisFromModelOutput,
+  buildSuggestionsFromModelOutput,
 } = require('../src/ai-engineer');
+const { createAiProvider } = require('../src/ai-provider');
 
 const sampleEvent = (over = {}) => ({
   id: 'ev-1',
@@ -256,4 +265,170 @@ test('suggestTests returns insufficientEvidence when no verified events exist, a
   assert.ok(withEvents.suggestions.some((s) => s.scenario.kind === 'duplicate' && s.scenario.params.mode === 'concurrent' && s.paypalEventId === 'WH-CAP-1'));
   // Includes follow-up on failed idempotent_processing check:
   assert.ok(withEvents.suggestions.some((s) => /run-1111/.test(s.rationale)));
+});
+
+test('data minimization and secret redaction strip secrets, tokens, emails, raw bodies, and response snippets', () => {
+  const dirty = 'Bearer secret-oauth-token-123456 and sk-proj-1234567890abcdef and buyer@example.com and 0123456789abcdef0123456789abcdef0123456789abcdef';
+  const redacted = redactSensitiveText(dirty);
+  assert.ok(!redacted.includes('secret-oauth-token-123456'));
+  assert.ok(!redacted.includes('sk-proj-1234567890abcdef'));
+  assert.ok(!redacted.includes('buyer@example.com'));
+  assert.ok(!redacted.includes('0123456789abcdef0123456789abcdef0123456789abcdef'));
+
+  const ev = {
+    ...sampleEvent(),
+    raw_body: '{"secret":"raw-webhook-body-should-never-be-sent","payer":{"email_address":"buyer@example.com"}}',
+    headers_json: '{"paypal-transmission-sig":"SECRET-SIG-123"}',
+  };
+  const safeEvents = sanitizeEventsForAi([ev], { selectedEventId: 'ev-1', probeConfigured: true });
+  const serializedEvents = JSON.stringify(safeEvents);
+  assert.ok(!serializedEvents.includes('raw-webhook-body-should-never-be-sent'));
+  assert.ok(!serializedEvents.includes('SECRET-SIG-123'));
+  assert.ok(!serializedEvents.includes('buyer@example.com'));
+  assert.ok(!serializedEvents.includes('CAP-1001'), 'resource_id is not sent to OpenAI');
+  assert.equal(safeEvents.verifiedEvents[0].paypalEventId, 'WH-UNIT-1001');
+
+  const safeTrace = sanitizeTraceForAi({
+    run: { id: 'r1', kind: 'duplicate', label: 'Duplicate delivery', status: 'completed', plannedAttempts: 2, destination: 'http://secret-host:4000/webhooks?token=xyz', params: { count: 2, mode: 'sequential' }, verdict: 'failed', verdictReason: 'Failed check' },
+    event: { id: 'ev-1', paypalEventId: 'WH-1', eventType: 'PAYMENT.CAPTURE.COMPLETED', resourceType: 'capture', resourceId: 'CAP-SECRET', verificationStatus: 'verified', processingStatus: 'forwarded' },
+    attempts: [{ attemptNo: 1, deliveryKind: 'original', outcome: 'http_error', httpStatus: 500, durationMs: 25, responseSnippet: 'Error: leaked db password=supersecret', destination: 'http://secret-host:4000' }],
+    assertions: [{ id: 'deliveries_accepted', category: 'delivery', name: 'Accepted', verdict: 'fail', summary: 'Failed delivery' }],
+    snapshots: [{ source: 'probe', phase: 'after', outcome: 'ok', data: { processedCount: 2, status: 'COMPLETED', paymentRecords: 2, secretField: 'never-send' } }],
+    probeConfigured: true,
+    probeSettleMs: 500,
+  });
+  const serializedTrace = JSON.stringify(safeTrace);
+  assert.ok(!serializedTrace.includes('supersecret'), 'responseSnippet must not be sent to OpenAI');
+  assert.ok(!serializedTrace.includes('secret-host'), 'destination URL must not be sent to OpenAI');
+  assert.ok(!serializedTrace.includes('CAP-SECRET'), 'resourceId must not be sent to OpenAI');
+  assert.ok(!serializedTrace.includes('never-send'), 'unlisted snapshot fields must not be sent to OpenAI');
+
+  const safeEv = sanitizeEvidenceForAi({
+    project: { id: 'p1', probeUrl: 'http://internal-probe/secret', paypalWebhookId: 'WHID123', forwardMode: 'manual' },
+    verifiedEvents: [ev],
+    runs: [{ id: 'run-1234567890', event_id: 'ev-1', kind: 'duplicate', params: { count: 2, mode: 'sequential' }, status: 'completed', verdict: 'failed' }],
+    failedAssertions: [{ run_id: 'run-1234567890', event_id: 'ev-1', check_id: 'idempotent_processing', name: 'Idempotent', summary: 'Processed twice' }],
+    neverEvaluatedChecks: [],
+  });
+  const serializedEv = JSON.stringify(safeEv);
+  assert.ok(!serializedEv.includes('internal-probe/secret'), 'probeUrl string itself is not sent');
+  assert.ok(!serializedEv.includes('WHID123'), 'paypalWebhookId string itself is not sent');
+});
+
+test('strict schema validators reject invalid model plans, analyses, and suggestions', () => {
+  const ev = sampleEvent();
+
+  // Valid model plan output succeeds:
+  const validPlan = buildPlanFromModelOutput({
+    objective: 'Verify duplicate webhook deliveries are processed at most once.',
+    requiredEventType: 'PAYMENT.CAPTURE.COMPLETED',
+    requiredVerificationStatus: 'verified',
+    matchedEventId: 'ev-1',
+    scenario: { kind: 'duplicate', params: { count: 3, mode: 'sequential' } },
+    expectedBehavior: 'Endpoint returns HTTP 200 and records the payment once.',
+    assertions: ['idempotent_processing', 'no_second_payment_in_app'],
+    failureConditions: ['Endpoint processes the event more than once.'],
+    financialOperationsAllowed: false,
+  }, { prompt: 'Test duplicate delivery', verifiedEvents: [ev], probeConfigured: true });
+  assert.equal(validPlan.validation.valid, true);
+  assert.equal(validPlan.matchedEventId, 'ev-1');
+
+  // Model refusal turns into 422 unsafe_request:
+  assert.throws(
+    () => buildPlanFromModelOutput({ refusal: 'Cannot create a live payment order.' }, { verifiedEvents: [ev] }),
+    (err) => err.status === 422 && err.code === 'unsafe_request'
+  );
+
+  // Forbidden flags or financialOperationsAllowed: true -> 502 ai_invalid_output:
+  assert.throws(
+    () => buildPlanFromModelOutput({
+      objective: 'Create an order and capture it.',
+      requiredEventType: 'PAYMENT.CAPTURE.COMPLETED',
+      scenario: { kind: 'forward', params: {} },
+      expectedBehavior: 'Captures money.',
+      assertions: ['deliveries_accepted'],
+      failureConditions: ['Fails'],
+      financialOperationsAllowed: true,
+    }, { verifiedEvents: [ev] }),
+    (err) => err.status === 502 && err.code === 'ai_invalid_output'
+  );
+
+  // Unknown check ID -> 502 ai_invalid_output:
+  assert.throws(
+    () => buildPlanFromModelOutput({
+      objective: 'Test duplicate delivery on capture completed.',
+      requiredEventType: 'PAYMENT.CAPTURE.COMPLETED',
+      scenario: { kind: 'duplicate', params: { count: 2, mode: 'sequential' } },
+      expectedBehavior: 'Returns 200 OK.',
+      assertions: ['invented_ai_check_id'],
+      failureConditions: ['Fails check'],
+      financialOperationsAllowed: false,
+    }, { verifiedEvents: [ev] }),
+    (err) => err.status === 502 && err.code === 'ai_invalid_output'
+  );
+
+  // Referencing an unverified/unknown event ID -> 502 ai_invalid_output:
+  assert.throws(
+    () => buildPlanFromModelOutput({
+      objective: 'Test duplicate delivery on capture completed.',
+      requiredEventType: 'PAYMENT.CAPTURE.COMPLETED',
+      matchedEventId: 'unverified-or-fake-event-id',
+      scenario: { kind: 'duplicate', params: { count: 2, mode: 'sequential' } },
+      expectedBehavior: 'Returns 200 OK.',
+      assertions: ['idempotent_processing'],
+      failureConditions: ['Fails check'],
+      financialOperationsAllowed: false,
+    }, { verifiedEvents: [ev] }),
+    (err) => err.status === 502 && err.code === 'ai_invalid_output'
+  );
+
+  // Model analysis trying to override deterministic verdict -> 502 ai_invalid_output:
+  const sampleTrace = {
+    run: { id: 'r1', kind: 'duplicate', label: 'Duplicate delivery', status: 'completed', plannedAttempts: 2, destination: 'http://localhost:4000/wh', params: { count: 2, mode: 'sequential' }, verdict: 'failed', verdictReason: 'Check failed' },
+    event: { id: 'ev-1', paypalEventId: 'WH-1', eventType: 'PAYMENT.CAPTURE.COMPLETED', verificationStatus: 'verified' },
+    attempts: [],
+    assertions: [{ id: 'idempotent_processing', category: 'invariant', name: 'Idempotent', verdict: 'fail', summary: 'Processed twice', evidence: [] }],
+    snapshots: [],
+    probeConfigured: true,
+  };
+  assert.throws(
+    () => buildAnalysisFromModelOutput({
+      deterministicVerdict: { status: 'passed', canOverride: true },
+      whatWasExpected: 'Expected single processing.',
+      whereFailureOccurred: 'None',
+      whyItMatters: 'Matters for safety.',
+      whatToInvestigate: 'Nothing to investigate.',
+      remediation: 'No changes needed.',
+      recommendations: ['Keep as is.'],
+    }, sampleTrace),
+    (err) => err.status === 502 && err.code === 'ai_invalid_output'
+  );
+
+  // Model suggestions referencing unknown event or invalid check -> 502 ai_invalid_output:
+  assert.throws(
+    () => buildSuggestionsFromModelOutput({
+      summary: 'Suggested follow-up tests.',
+      suggestions: [{
+        id: 'sug-1',
+        priority: 'high',
+        title: 'Test duplicate delivery',
+        rationale: 'Because duplicate delivery was not run yet.',
+        basedOn: ['Event WH-UNIT-1001'],
+        eventId: 'non-existent-event',
+        scenario: { kind: 'duplicate', params: { count: 2, mode: 'sequential' } },
+        targetChecks: ['idempotent_processing'],
+      }],
+    }, { verifiedEvents: [ev] }),
+    (err) => err.status === 502 && err.code === 'ai_invalid_output'
+  );
+});
+
+test('createAiProvider reports unconfigured state without key and maps timeouts/errors safely', async () => {
+  const unconfigured = createAiProvider({ apiKey: null, model: 'gpt-4o-mini', timeoutMs: 1000 });
+  assert.equal(unconfigured.isConfigured(), false);
+  assert.equal(unconfigured.status().configured, false);
+  await assert.rejects(
+    () => unconfigured.generateTestPlan({ prompt: 'Test duplicate delivery', allowlistedContext: {} }),
+    (err) => err.status === 503 && err.code === 'ai_not_configured'
+  );
 });

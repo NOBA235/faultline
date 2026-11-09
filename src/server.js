@@ -21,6 +21,11 @@ const app = createApp({ config, db, paypal });
 const server = app.listen(config.port, config.host, () => {
   console.log(`FAULTLINE listening on http://${config.host}:${config.port}`);
   console.log('PayPal environment: Sandbox (https://api-m.sandbox.paypal.com)');
+  console.log(
+    config.openaiApiKey
+      ? `AI Test Engineer: OpenAI configured (model: ${config.openaiModel})`
+      : 'AI Test Engineer: OpenAI disabled (set OPENAI_API_KEY in .env to enable AI planning and trace analysis)'
+  );
 });
 
 function shutdown() {

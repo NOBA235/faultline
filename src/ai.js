@@ -2,17 +2,45 @@
 const crypto = require('node:crypto');
 const { ApiError } = require('./errors');
 const {
-  planFromPrompt,
   validateTestSpec,
-  analyzeRun,
   suggestTests,
+  sanitizePromptInput,
+  sanitizeEventsForAi,
+  sanitizeTraceForAi,
+  sanitizeEvidenceForAi,
+  buildPlanFromModelOutput,
+  buildAnalysisFromModelOutput,
+  buildSuggestionsFromModelOutput,
 } = require('./ai-engineer');
 
 const iso = () => new Date().toISOString();
 const sha256 = (s) => crypto.createHash('sha256').update(s).digest('hex');
 const KEY_RE = /^[A-Za-z0-9_-]{8,100}$/;
+const AI_RATE_WINDOW_MS = 60 * 1000;
+const DEFAULT_AI_RATE_MAX = 20;
 
-function registerAiRoutes({ app, db, config, forwarder, requireAuth, getProjectRow }) {
+function registerAiRoutes({ app, db, config, forwarder, ai, requireAuth, wrap, getProjectRow }) {
+  const rateBuckets = new Map(); // key -> { count, resetAt }
+  const maxPerMinute = (config && config.aiRateLimitMax) || DEFAULT_AI_RATE_MAX;
+
+  function enforceAiRateLimit(req, projectId) {
+    const key = `${req.ip || 'local'}:${projectId}`;
+    const now = Date.now();
+    const bucket = rateBuckets.get(key);
+    if (bucket && bucket.resetAt > now) {
+      if (bucket.count >= maxPerMinute) {
+        throw new ApiError(
+          429,
+          'ai_rate_limited',
+          `Too many AI requests for this project (${maxPerMinute} per minute limit). Wait a moment and try again.`
+        );
+      }
+      bucket.count += 1;
+    } else {
+      rateBuckets.set(key, { count: 1, resetAt: now + AI_RATE_WINDOW_MS });
+    }
+  }
+
   const publicPlan = (r) => ({
     id: r.id,
     projectId: r.project_id,
@@ -122,13 +150,49 @@ function registerAiRoutes({ app, db, config, forwarder, requireAuth, getProjectR
     };
   }
 
-  // ---- Natural-language test planning -------------------------------------
-  app.post('/api/projects/:id/ai/plans', requireAuth, (req, res) => {
+  function collectSuggestionEvidence(project) {
+    const verifiedEvents = db.prepare(`SELECT id, paypal_event_id, event_type, resource_type, resource_id, paypal_event_created_at, first_received_at, processing_status, related_order_id
+      FROM webhook_events WHERE project_id = ? AND verification_status = 'verified' ORDER BY first_received_at DESC, rowid DESC LIMIT 50`).all(project.id);
+    const unverifiedEvents = db.prepare(`SELECT id, paypal_event_id, event_type, verification_status
+      FROM webhook_events WHERE project_id = ? AND verification_status != 'verified' ORDER BY first_received_at DESC, rowid DESC LIMIT 20`).all(project.id);
+    const runs = db.prepare(`SELECT id, event_id, kind, params_json, status, verdict, created_at
+      FROM scenario_runs WHERE project_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 100`).all(project.id)
+      .map((r) => ({ ...r, params: JSON.parse(r.params_json) }));
+    const failedAssertions = db.prepare(`SELECT a.run_id, a.check_id, a.name, a.summary, r.event_id
+      FROM assertion_results a JOIN scenario_runs r ON r.id = a.run_id
+      WHERE a.project_id = ? AND a.verdict = 'fail' ORDER BY a.id DESC LIMIT 20`).all(project.id);
+    const neverEvaluatedChecks = db.prepare(`SELECT check_id, MIN(name) AS name
+      FROM assertion_results WHERE project_id = ? AND verdict != 'not_applicable'
+      GROUP BY check_id HAVING SUM(verdict = 'pass') = 0 AND SUM(verdict = 'fail') = 0 AND SUM(verdict = 'not_evaluable') > 0`).all(project.id);
+
+    return {
+      project: {
+        id: project.id,
+        probeUrl: project.probe_url,
+        paypalWebhookId: project.paypal_webhook_id,
+        forwardMode: project.forward_mode,
+      },
+      verifiedEvents,
+      unverifiedEvents,
+      runs,
+      failedAssertions,
+      neverEvaluatedChecks,
+    };
+  }
+
+  // ---- AI provider status -------------------------------------------------
+  app.get('/api/projects/:id/ai/status', requireAuth, (req, res) => {
+    getProjectRow(req.params.id);
+    res.json(ai.status());
+  });
+
+  // ---- Natural-language test planning (OpenAI model + strict validation) ---
+  app.post('/api/projects/:id/ai/plans', requireAuth, wrap(async (req, res) => {
     const project = getProjectRow(req.params.id);
     if (!req.body || typeof req.body !== 'object' || Array.isArray(req.body)) {
       throw new ApiError(400, 'invalid_body', 'The request body must be a JSON object.');
     }
-    const prompt = typeof req.body.prompt === 'string' ? req.body.prompt : '';
+    const rawPrompt = typeof req.body.prompt === 'string' ? req.body.prompt : '';
     const selectedEventId = typeof req.body.eventId === 'string' && req.body.eventId ? req.body.eventId : null;
     if (selectedEventId) {
       const ev = db.prepare('SELECT id, verification_status FROM webhook_events WHERE id = ? AND project_id = ?').get(selectedEventId, project.id);
@@ -138,29 +202,39 @@ function registerAiRoutes({ app, db, config, forwarder, requireAuth, getProjectR
       }
     }
 
+    const cleanPrompt = sanitizePromptInput(rawPrompt);
+    enforceAiRateLimit(req, project.id);
+
     const verifiedEvents = db.prepare(`SELECT id, paypal_event_id, event_type, resource_type, resource_id, paypal_event_created_at, first_received_at, processing_status
       FROM webhook_events WHERE project_id = ? AND verification_status = 'verified' ORDER BY first_received_at DESC, rowid DESC LIMIT 100`).all(project.id);
 
-    const { spec, validation, matchedEventId } = planFromPrompt(prompt, {
-      verifiedEvents,
+    const allowlistedContext = sanitizeEventsForAi(verifiedEvents, {
       selectedEventId,
       probeConfigured: Boolean(project.probe_url),
     });
 
-    if (!validation.valid) {
-      throw new ApiError(400, 'validation_failed', `The generated test specification failed validation: ${validation.errors.join(' ')}`, { prompt: validation.errors.join(' ') });
-    }
+    const rawModelOutput = await ai.generateTestPlan({
+      prompt: cleanPrompt,
+      allowlistedContext,
+    });
+
+    const { spec, matchedEventId } = buildPlanFromModelOutput(rawModelOutput, {
+      prompt: cleanPrompt,
+      verifiedEvents,
+      selectedEventId,
+      probeConfigured: Boolean(project.probe_url),
+    });
 
     const id = crypto.randomUUID();
     const now = iso();
     db.prepare(`INSERT INTO ai_test_plans
       (id, project_id, prompt, provider, spec_json, validation_status, validation_errors_json, matched_event_id, created_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-      .run(id, project.id, prompt.trim(), 'faultline_ai_engineer', JSON.stringify(spec), 'valid', JSON.stringify([]), matchedEventId, now);
+      .run(id, project.id, cleanPrompt, ai.providerLabel, JSON.stringify(spec), 'valid', JSON.stringify([]), matchedEventId, now);
 
     const saved = db.prepare('SELECT * FROM ai_test_plans WHERE id = ?').get(id);
     res.status(201).json({ plan: publicPlan(saved) });
-  });
+  }));
 
   app.get('/api/projects/:id/ai/plans', requireAuth, (req, res) => {
     const project = getProjectRow(req.params.id);
@@ -175,7 +249,7 @@ function registerAiRoutes({ app, db, config, forwarder, requireAuth, getProjectR
     res.json({ plan: publicPlan(row) });
   });
 
-  // Validates the stored test specification again and executes it against a real, PayPal-verified event.
+  // Validates the stored test specification again and executes it against a real, PayPal-verified event (behind user confirmation).
   app.post('/api/projects/:id/ai/plans/:planId/execute', requireAuth, (req, res) => {
     const project = getProjectRow(req.params.id);
     const row = db.prepare('SELECT * FROM ai_test_plans WHERE id = ? AND project_id = ?').get(req.params.planId, project.id);
@@ -223,8 +297,8 @@ function registerAiRoutes({ app, db, config, forwarder, requireAuth, getProjectR
     });
   });
 
-  // ---- Evidence-based failure analysis ------------------------------------
-  app.post('/api/projects/:id/scenario-runs/:runId/analyze', requireAuth, (req, res) => {
+  // ---- Evidence-based failure analysis (OpenAI model + strict guardrails) --
+  app.post('/api/projects/:id/scenario-runs/:runId/analyze', requireAuth, wrap(async (req, res) => {
     const project = getProjectRow(req.params.id);
     const run = db.prepare('SELECT * FROM scenario_runs WHERE id = ? AND project_id = ?').get(req.params.runId, project.id);
     if (!run) throw new ApiError(404, 'not_found', 'Scenario run not found.');
@@ -232,9 +306,15 @@ function registerAiRoutes({ app, db, config, forwarder, requireAuth, getProjectR
       throw new ApiError(409, 'run_not_finished', 'This scenario has not finished yet. Wait for it to finish before analyzing the execution trace.');
     }
 
+    enforceAiRateLimit(req, project.id);
+
     const trace = buildExecutionTrace(project, run);
-    const evidenceHash = sha256(JSON.stringify(trace));
-    const analysis = analyzeRun(trace);
+    const allowlistedTrace = sanitizeTraceForAi(trace);
+    const evidenceHash = sha256(JSON.stringify(allowlistedTrace));
+
+    const rawModelOutput = await ai.generateRunAnalysis({ allowlistedTrace });
+    const analysis = buildAnalysisFromModelOutput(rawModelOutput, trace);
+
     const id = crypto.randomUUID();
     const now = iso();
 
@@ -245,11 +325,11 @@ function registerAiRoutes({ app, db, config, forwarder, requireAuth, getProjectR
         analysis_json = excluded.analysis_json,
         evidence_hash = excluded.evidence_hash,
         created_at = excluded.created_at`)
-      .run(id, run.id, project.id, 'faultline_ai_engineer', JSON.stringify(analysis), evidenceHash, now);
+      .run(id, run.id, project.id, ai.providerLabel, JSON.stringify(analysis), evidenceHash, now);
 
     const saved = db.prepare('SELECT * FROM ai_run_analyses WHERE run_id = ?').get(run.id);
     res.json({ analysis: publicAnalysis(saved) });
-  });
+  }));
 
   app.get('/api/projects/:id/scenario-runs/:runId/analysis', requireAuth, (req, res) => {
     const project = getProjectRow(req.params.id);
@@ -259,39 +339,49 @@ function registerAiRoutes({ app, db, config, forwarder, requireAuth, getProjectR
     res.json({ analysis: saved ? publicAnalysis(saved) : null });
   });
 
-  // ---- Evidence-based test suggestions ------------------------------------
+  // ---- Coverage-gap analysis (deterministic) & AI follow-up suggestions ---
   app.get('/api/projects/:id/ai/suggestions', requireAuth, (req, res) => {
     const project = getProjectRow(req.params.id);
-    const verifiedEvents = db.prepare(`SELECT id, paypal_event_id, event_type, resource_type, resource_id, paypal_event_created_at, first_received_at, processing_status, related_order_id
-      FROM webhook_events WHERE project_id = ? AND verification_status = 'verified' ORDER BY first_received_at DESC, rowid DESC LIMIT 50`).all(project.id);
-    const unverifiedEvents = db.prepare(`SELECT id, paypal_event_id, event_type, verification_status
-      FROM webhook_events WHERE project_id = ? AND verification_status != 'verified' ORDER BY first_received_at DESC, rowid DESC LIMIT 20`).all(project.id);
-    const runs = db.prepare(`SELECT id, event_id, kind, params_json, status, verdict, created_at
-      FROM scenario_runs WHERE project_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 100`).all(project.id)
-      .map((r) => ({ ...r, params: JSON.parse(r.params_json) }));
-    const failedAssertions = db.prepare(`SELECT a.run_id, a.check_id, a.name, a.summary, r.event_id
-      FROM assertion_results a JOIN scenario_runs r ON r.id = a.run_id
-      WHERE a.project_id = ? AND a.verdict = 'fail' ORDER BY a.id DESC LIMIT 20`).all(project.id);
-    const neverEvaluatedChecks = db.prepare(`SELECT check_id, MIN(name) AS name
-      FROM assertion_results WHERE project_id = ? AND verdict != 'not_applicable'
-      GROUP BY check_id HAVING SUM(verdict = 'pass') = 0 AND SUM(verdict = 'fail') = 0 AND SUM(verdict = 'not_evaluable') > 0`).all(project.id);
-
-    const result = suggestTests({
-      project: {
-        id: project.id,
-        probeUrl: project.probe_url,
-        paypalWebhookId: project.paypal_webhook_id,
-        forwardMode: project.forward_mode,
-      },
-      verifiedEvents,
-      unverifiedEvents,
-      runs,
-      failedAssertions,
-      neverEvaluatedChecks,
+    const evidence = collectSuggestionEvidence(project);
+    const result = suggestTests(evidence);
+    res.json({
+      ...result,
+      source: 'deterministic_coverage',
+      provider: null,
+      aiConfigured: ai.isConfigured(),
     });
-
-    res.json(result);
   });
+
+  app.post('/api/projects/:id/ai/suggestions', requireAuth, wrap(async (req, res) => {
+    const project = getProjectRow(req.params.id);
+    enforceAiRateLimit(req, project.id);
+    const evidence = collectSuggestionEvidence(project);
+
+    if (evidence.verifiedEvents.length === 0) {
+      // Ensure AI configuration check still runs so unconfigured servers report 503 ai_not_configured consistently
+      if (!ai.isConfigured()) {
+        await ai.generateTestSuggestions({ allowlistedEvidence: sanitizeEvidenceForAi(evidence) });
+      }
+      const empty = suggestTests(evidence);
+      return res.json({
+        ...empty,
+        source: 'openai',
+        provider: ai.providerLabel,
+        aiConfigured: true,
+      });
+    }
+
+    const allowlistedEvidence = sanitizeEvidenceForAi(evidence);
+    const rawModelOutput = await ai.generateTestSuggestions({ allowlistedEvidence });
+    const validated = buildSuggestionsFromModelOutput(rawModelOutput, evidence);
+
+    res.json({
+      ...validated,
+      source: 'openai',
+      provider: ai.providerLabel,
+      aiConfigured: true,
+    });
+  }));
 }
 
 module.exports = { registerAiRoutes };

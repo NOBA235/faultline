@@ -33,8 +33,9 @@
     overview: null, findings: [], failedAssertions: [], runFilter: '', runKindFilter: '', probeResult: null, probeError: null,
     scenarioForm: { kind: 'forward', count: '3', mode: 'sequential', delaySeconds: '10' },
     aiPrompt: 'Test whether my application processes the same completed payment webhook twice.',
+    aiStatus: null,
     aiPlans: [], aiSelectedPlan: null, aiPlanEventId: '', aiPlanError: null,
-    aiAnalysis: null, aiAnalysisRunId: '', aiAnalysisError: null, aiSuggestions: null,
+    aiAnalysis: null, aiAnalysisRunId: '', aiAnalysisError: null, aiSuggestions: null, aiSuggestionError: null,
   };
   let pollTimer = null;
 
@@ -114,7 +115,9 @@
   // ---- screens ----------------------------------------------------------
   function topbar(signedIn) {
     return h('header', { class: 'topbar' },
-      h('span', { class: 'wordmark' }, 'Faultline'),
+      h('span', { class: 'wordmark' },
+        h('img', { class: 'brand-mark', src: '/faultline-mark.svg', alt: '', 'aria-hidden': 'true' }),
+        h('span', null, 'FAULTLINE')),
       h('span', { class: 'env-tag' }, 'PayPal Sandbox'),
       h('span', { class: 'spacer' }),
       signedIn ? h('button', { class: 'btn', type: 'button', onclick: signOut }, 'Sign out') : null);
@@ -196,7 +199,7 @@
         state.runDetail = null; state.runError = null; state.scenarioKey = newKey(); state.labEventId = '';
         state.runFilter = ''; state.runKindFilter = '';
         state.aiPlans = []; state.aiSelectedPlan = null; state.aiPlanEventId = ''; state.aiPlanError = null;
-        state.aiAnalysis = null; state.aiAnalysisRunId = ''; state.aiAnalysisError = null; state.aiSuggestions = null;
+        state.aiAnalysis = null; state.aiAnalysisRunId = ''; state.aiAnalysisError = null; state.aiSuggestions = null; state.aiSuggestionError = null;
       }
       state.orderProjectId = id;
       await loadOrderData(id);
@@ -589,7 +592,7 @@
     if (f.status) qs.set('status', f.status);
     if (f.type) qs.set('type', f.type);
     if (f.q.trim()) qs.set('q', f.q.trim());
-    const [e, d, c, r, o, fnd, plans, sug] = await Promise.all([
+    const [e, d, c, r, o, fnd, plans, sug, aiSt] = await Promise.all([
       api('GET', `/api/projects/${projectId}/events?${qs}`),
       api('GET', `/api/projects/${projectId}/webhook-deliveries`),
       api('GET', `/api/projects/${projectId}/paypal-calls`),
@@ -598,10 +601,12 @@
       api('GET', `/api/projects/${projectId}/findings`),
       api('GET', `/api/projects/${projectId}/ai/plans`),
       api('GET', `/api/projects/${projectId}/ai/suggestions`),
+      api('GET', `/api/projects/${projectId}/ai/status`),
     ]);
     state.overview = o; state.findings = fnd.findings; state.failedAssertions = fnd.failedAssertions || [];
     state.events = e.events; state.eventTotal = e.total; state.eventTypes = e.eventTypes; state.deliveries = d.deliveries; state.calls = c.calls; state.runs = r.runs;
-    state.aiPlans = plans.plans; state.aiSuggestions = sug;
+    state.aiPlans = plans.plans; state.aiStatus = aiSt;
+    if (!state.aiSuggestions || state.aiSuggestions.source !== 'openai') state.aiSuggestions = sug;
     if (state.aiSelectedPlan) state.aiSelectedPlan = state.aiPlans.find((x) => x.id === state.aiSelectedPlan.id) || state.aiPlans[0] || null;
     else if (state.aiPlans.length) state.aiSelectedPlan = state.aiPlans[0];
     const verified = state.events.filter((x) => x.verification.status === 'verified');
@@ -1252,21 +1257,28 @@
       } catch (ex) { state.runError = ex; }
       renderMain();
     } }, 'Cancel') : null;
+    const aiReady = Boolean(state.aiStatus && state.aiStatus.configured);
     const canAnalyze = ['completed', 'failed', 'cancelled'].includes(run.status);
-    const analyzeBtn = canAnalyze ? h('button', { class: 'btn primary', type: 'button', onclick: async () => {
-      analyzeBtn.disabled = true; analyzeBtn.textContent = 'Analyzing evidence\u2026';
-      state.aiAnalysisError = null;
-      try {
-        const data = await api('POST', `/api/projects/${p.id}/scenario-runs/${run.id}/analyze`);
-        state.aiAnalysis = data.analysis;
-        state.aiAnalysisRunId = run.id;
-        state.runDetail = await api('GET', `/api/projects/${p.id}/scenario-runs/${run.id}`);
-      } catch (ex) {
-        if (ex.status === 401) return showLogin('Your session ended. Sign in again.');
-        state.aiAnalysisError = ex;
-      }
-      renderMain();
-    } }, aiAnalysis ? 'Re-analyze evidence' : 'Analyze with AI Test Engineer') : null;
+    const analyzeBtn = canAnalyze ? h('button', {
+      class: 'btn primary',
+      type: 'button',
+      disabled: !aiReady,
+      title: aiReady ? '' : 'Set OPENAI_API_KEY in your server .env file and restart Faultline to enable OpenAI trace analysis.',
+      onclick: async () => {
+        analyzeBtn.disabled = true; analyzeBtn.textContent = 'Analyzing evidence\u2026';
+        state.aiAnalysisError = null;
+        try {
+          const data = await api('POST', `/api/projects/${p.id}/scenario-runs/${run.id}/analyze`);
+          state.aiAnalysis = data.analysis;
+          state.aiAnalysisRunId = run.id;
+          state.runDetail = await api('GET', `/api/projects/${p.id}/scenario-runs/${run.id}`);
+        } catch (ex) {
+          if (ex.status === 401) return showLogin('Your session ended. Sign in again.');
+          state.aiAnalysisError = ex;
+        }
+        renderMain();
+      },
+    }, aiAnalysis ? 'Re-analyze evidence (OpenAI)' : 'Analyze with AI Test Engineer') : null;
     const secs = (ms) => (ms === null || ms === undefined ? '\u2014' : `${(ms / 1000).toFixed(1)} s`);
     const attemptRows = attempts.map((a) => h('tr', null,
       h('td', null, `${a.attemptNo} of ${run.plannedAttempts}`),
@@ -1305,6 +1317,7 @@
       assertionsTable(state.runDetail),
       snapshotsTable(state.runDetail),
       result.risks && result.risks.length ? h('div', { class: 'alert idle', role: 'status' }, h('strong', null, 'Inferred risks (suspicions, not verdicts)'), h('ul', null, result.risks.map((x) => h('li', null, x)))) : null,
+      state.aiAnalysisError ? errorBox(state.aiAnalysisError) : null,
       aiAnalysis ? aiAnalysisView(aiAnalysis) : null,
       h('h2', { class: 'section spaced' }, 'Delivery attempts'),
       h('div', { class: 'table-wrap' }, h('table', { class: 'checks' },
@@ -1571,10 +1584,12 @@ app.get('/faultline-probe', async (req, res) => {
     const vCls = dv.status === 'passed' ? 'ok' : dv.status === 'failed' ? 'bad' : 'warn';
     const vLabel = (VERDICT[dv.status] || [0, dv.status || 'Not evaluated'])[1];
     return h('div', { class: 'ai-analysis' },
-      h('h2', { class: 'section spaced' }, 'AI Test Engineer failure analysis'),
+      h('div', { class: 'title-row' },
+        h('h2', { class: 'section nomargin' }, 'AI Test Engineer failure analysis'),
+        a.provider ? h('span', { class: 'badge info' }, `Provider: ${a.provider}`) : null),
       h('div', { class: `alert ${vCls}`, role: 'status' },
         h('strong', null, `Deterministic verdict: ${vLabel} (locked)`),
-        h('p', { class: 'alert-text' }, dv.notice || 'This verdict comes solely from Faultline\u2019s deterministic checks. The AI Test Engineer cannot alter or override it.')),
+        h('p', { class: 'alert-text' }, dv.notice || 'This verdict comes solely from Faultline\u2019s deterministic checks in src/checks.js. The OpenAI model cannot decide, alter, or override it.')),
       a.insufficientEvidence ? h('div', { class: 'alert warn', role: 'status' },
         h('strong', null, 'Insufficient evidence to confirm internal state'),
         h('p', { class: 'alert-text' }, a.insufficientReason || 'Some application-state checks could not be evaluated from the available trace.')) : null,
@@ -1623,7 +1638,7 @@ app.get('/faultline-probe', async (req, res) => {
         }
         renderMain();
       },
-    }, 'Execute validated test plan');
+    }, 'Confirm & execute validated test plan');
 
     const assertionRows = (spec.assertions || []).map((a) => h('tr', null,
       h('td', null, h('strong', null, a.name), h('div', { class: 'hint block' }, CATEGORY[a.category] || a.category)),
@@ -1641,8 +1656,9 @@ app.get('/faultline-probe', async (req, res) => {
     return h('div', { class: 'spec-box' },
       h('div', { class: 'title-row' },
         h('h3', { class: 'subsection nomargin' }, 'Structured test specification'),
-        plan.validationStatus === 'valid' ? h('span', { class: 'badge ok' }, 'Validated specification') : h('span', { class: 'badge bad' }, 'Invalid specification'),
-        plan.executedRunId ? h('span', { class: 'badge idle' }, 'Executed') : null),
+        plan.validationStatus === 'valid' ? h('span', { class: 'badge ok' }, 'Schema & rules validated') : h('span', { class: 'badge bad' }, 'Invalid specification'),
+        plan.provider ? h('span', { class: 'badge info' }, `Provider: ${plan.provider}`) : null,
+        plan.executedRunId ? h('span', { class: 'badge idle' }, 'Executed') : h('span', { class: 'badge warn' }, 'Awaiting confirmation')),
       h('dl', { class: 'facts' },
         h('dt', null, 'Plain-English request'), h('dd', null, plan.prompt),
         h('dt', null, 'Test objective'), h('dd', null, spec.objective),
@@ -1651,7 +1667,7 @@ app.get('/faultline-probe', async (req, res) => {
         h('dt', null, 'Delivery attempts'), h('dd', null, `${spec.plannedAttempts} planned (${spec.requestsToSend} HTTP request(s) to send)`),
         h('dt', null, 'Expected behavior'), h('dd', null, spec.expectedBehavior),
         h('dt', null, 'Safety boundary'), h('dd', null, spec.safetyNotice)),
-      h('h3', { class: 'subsection spaced' }, 'Deterministic assertions'),
+      h('h3', { class: 'subsection spaced' }, 'Deterministic assertions (sole source of test verdict)'),
       h('div', { class: 'table-wrap' }, h('table', { class: 'checks' },
         h('thead', null, h('tr', null, ['Deterministic check', 'Evidence source', 'Pass criterion'].map((t) => h('th', { scope: 'col' }, t)))),
         h('tbody', null, assertionRows))),
@@ -1663,6 +1679,22 @@ app.get('/faultline-probe', async (req, res) => {
   }
 
   function aiEngineerPanel(p) {
+    const aiSt = state.aiStatus;
+    const aiReady = Boolean(aiSt && aiSt.configured);
+    const modelLabel = aiSt && aiSt.model ? aiSt.model : 'gpt-4o-mini';
+
+    const statusBadgeEl = aiReady
+      ? h('span', { class: 'badge ok' }, `OpenAI (${modelLabel}) \u00B7 Configured`)
+      : h('span', { class: 'badge warn' }, 'OpenAI not configured');
+
+    const setupNotice = aiReady
+      ? h('div', { class: 'alert idle', role: 'status' },
+        h('strong', null, `OpenAI connected (${modelLabel}) \u00B7 Strict deterministic & privacy guardrails active.`),
+        h('p', { class: 'alert-text' }, 'Only allow-listed, sanitized event/run metadata is sent to OpenAI (never PayPal secrets, OAuth tokens, encryption keys, or raw webhook bodies). Every model output is validated against strict schemas before saving, execution requires your confirmation, and deterministic checks in src/checks.js remain the sole source of test verdicts.'))
+      : h('div', { class: 'alert warn', role: 'status' },
+        h('strong', null, 'AI features are unavailable because OPENAI_API_KEY is not configured.'),
+        h('p', { class: 'alert-text' }, `To enable OpenAI test planning, trace explanations, and AI follow-up suggestions, set OPENAI_API_KEY=<your_key> (and optional OPENAI_MODEL=${modelLabel}) in your server .env file and restart Faultline. All PayPal Sandbox order/capture operations, webhook signature verification, Test Lab fault scenarios, and deterministic safety checks work without an AI key.`));
+
     const promptInput = h('input', {
       id: 'aiPrompt',
       type: 'text',
@@ -1671,10 +1703,15 @@ app.get('/faultline-probe', async (req, res) => {
       autocomplete: 'off',
       oninput: (e) => { state.aiPrompt = e.target.value; },
     });
-    const planBtn = h('button', { class: 'btn primary', type: 'submit' }, 'Generate test plan');
+    const planBtn = h('button', {
+      class: 'btn primary',
+      type: 'submit',
+      disabled: !aiReady,
+      title: aiReady ? '' : 'Set OPENAI_API_KEY in .env and restart Faultline to enable AI test planning.',
+    }, 'Generate test plan (OpenAI)');
     const planForm = h('form', { class: 'row-form', novalidate: true, onsubmit: async (e) => {
       e.preventDefault();
-      planBtn.disabled = true; planBtn.textContent = 'Planning\u2026';
+      planBtn.disabled = true; planBtn.textContent = 'Planning with OpenAI\u2026';
       state.aiPlanError = null;
       try {
         const data = await api('POST', `/api/projects/${p.id}/ai/plans`, { prompt: state.aiPrompt });
@@ -1713,6 +1750,8 @@ app.get('/faultline-probe', async (req, res) => {
     const analyzeRunBtn = finishedRuns.length ? h('button', {
       class: 'btn primary',
       type: 'button',
+      disabled: !aiReady,
+      title: aiReady ? '' : 'Set OPENAI_API_KEY in .env and restart Faultline to enable AI run analysis.',
       onclick: async () => {
         const targetId = runSelect ? runSelect.value : currentRunId;
         if (!targetId) return;
@@ -1731,10 +1770,29 @@ app.get('/faultline-probe', async (req, res) => {
         }
         renderMain();
       },
-    }, 'Explain run from evidence') : null;
+    }, 'Explain run from evidence (OpenAI)') : null;
 
     // Suggestions section
     const sug = state.aiSuggestions;
+    const isAiSuggestions = Boolean(sug && sug.source === 'openai');
+    const generateSugBtn = h('button', {
+      class: 'btn primary',
+      type: 'button',
+      disabled: !aiReady,
+      title: aiReady ? '' : 'Set OPENAI_API_KEY in .env and restart Faultline to generate OpenAI follow-up suggestions.',
+      onclick: async () => {
+        generateSugBtn.disabled = true; generateSugBtn.textContent = 'Asking OpenAI\u2026';
+        state.aiSuggestionError = null;
+        try {
+          state.aiSuggestions = await api('POST', `/api/projects/${p.id}/ai/suggestions`, {});
+        } catch (ex) {
+          if (ex.status === 401) return showLogin('Your session ended. Sign in again.');
+          state.aiSuggestionError = ex;
+        }
+        renderMain();
+      },
+    }, isAiSuggestions ? 'Refresh AI suggestions (OpenAI)' : 'Generate AI suggestions (OpenAI)');
+
     const suggestionRows = (sug && sug.suggestions ? sug.suggestions : []).map((s) => h('tr', null,
       h('td', null, h('strong', null, s.title), h('div', { class: 'hint block mono' }, `${s.eventType} \u00B7 ${s.paypalEventId || s.eventId}`)),
       h('td', null, h('span', { class: `badge ${s.priority === 'high' ? 'bad' : s.priority === 'medium' ? 'warn' : 'idle'}` }, pretty(s.priority))),
@@ -1759,8 +1817,12 @@ app.get('/faultline-probe', async (req, res) => {
       })())));
 
     return h('section', { class: 'panel' },
-      h('h2', { class: 'section' }, 'AI Test Engineer'),
-      h('p', { class: 'hint-text' }, 'Plans structured webhook reliability tests from plain English, explains failures using only stored execution traces, and recommends next tests from observed evidence. It cannot fabricate events, invent passing results, access PayPal secrets, or override deterministic checks.'),
+      h('div', { class: 'title-row' },
+        h('h2', { class: 'section nomargin' }, 'AI Test Engineer'),
+        statusBadgeEl,
+        h('span', { class: 'badge idle' }, 'Deterministic verdicts only')),
+      h('p', { class: 'hint-text' }, 'Uses OpenAI to interpret plain-English reliability requests into schema-validated test plans, explain completed runs from sanitized execution traces, and suggest follow-up tests. The model can never initiate PayPal financial operations, fabricate events, or decide/override a test verdict.'),
+      setupNotice,
       planForm,
       quickBtns,
       state.aiPlanError ? errorBox(state.aiPlanError) : null,
@@ -1773,7 +1835,13 @@ app.get('/faultline-probe', async (req, res) => {
           h('div', { class: 'field' }, h('span', { class: 'label' }, '\u00A0'), analyzeRunBtn)),
       state.aiAnalysisError ? errorBox(state.aiAnalysisError) : null,
       activeAnalysis ? aiAnalysisView(activeAnalysis) : null,
-      h('h2', { class: 'section spaced' }, 'Recommended additional tests (from stored evidence)'),
+      h('div', { class: 'title-row spaced' },
+        h('h2', { class: 'section nomargin' }, 'Recommended additional tests (from stored evidence)'),
+        isAiSuggestions
+          ? h('span', { class: 'badge info' }, `AI suggestions (${sug.provider || 'OpenAI'})`)
+          : h('span', { class: 'badge idle' }, 'Deterministic coverage gaps'),
+        h('div', { class: 'actions' }, generateSugBtn)),
+      state.aiSuggestionError ? errorBox(state.aiSuggestionError) : null,
       sug ? h('p', { class: 'hint-text' }, sug.summary) : null,
       !sug || sug.insufficientEvidence || !sug.suggestions.length
         ? h('p', { class: 'empty' }, sug && sug.insufficientEvidence ? 'Receive at least one PayPal-verified webhook event to unlock integration-specific test recommendations.' : 'All standard fault scenarios have been exercised on the currently stored verified events.')

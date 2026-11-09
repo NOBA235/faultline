@@ -12,6 +12,7 @@ const { createForwarder } = require('./forwarder');
 const { registerScenarioRoutes } = require('./scenarios');
 const { registerReportRoutes } = require('./reports');
 const { registerAiRoutes } = require('./ai');
+const { createAiProvider } = require('./ai-provider');
 
 const SESSION_COOKIE = 'fl_session';
 const SESSION_TTL_MS = 12 * 60 * 60 * 1000;
@@ -36,8 +37,13 @@ function readCookie(req, name) {
   return null;
 }
 
-function createApp({ config, db, paypal }) {
+function createApp({ config, db, paypal, ai }) {
   const cipher = createCipher(config.encryptionKey);
+  const aiProvider = ai || createAiProvider({
+    apiKey: config.openaiApiKey || null,
+    model: config.openaiModel || 'gpt-4o-mini',
+    timeoutMs: config.openaiTimeoutMs || 15000,
+  });
   const app = express();
   app.disable('x-powered-by');
 
@@ -286,7 +292,7 @@ function createApp({ config, db, paypal }) {
   registerWebhookRoutes({ app, db, paypal, service, config, requireAuth, wrap, getProjectRow: getRow, forwarder });
   registerScenarioRoutes({ app, db, forwarder, requireAuth, getProjectRow: getRow });
   registerReportRoutes({ app, db, forwarder, requireAuth, getProjectRow: getRow });
-  registerAiRoutes({ app, db, config, forwarder, requireAuth, getProjectRow: getRow });
+  registerAiRoutes({ app, db, config, forwarder, ai: aiProvider, requireAuth, wrap, getProjectRow: getRow });
 
   app.use('/api', (req, res, next) => next(new ApiError(404, 'not_found', 'No such API endpoint.')));
 

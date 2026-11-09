@@ -30,6 +30,13 @@ function loadConfig(env = process.env) {
   const forwardTimeoutMs = readInt(env.FORWARD_TIMEOUT_MS, 10000, 1000, 60000, 'FORWARD_TIMEOUT_MS', problems);
   const probeSettleMs = readInt(env.PROBE_SETTLE_MS, 500, 0, 10000, 'PROBE_SETTLE_MS', problems);
   const paypalTimeoutMs = readInt(env.PAYPAL_TIMEOUT_MS, 10000, 1000, 60000, 'PAYPAL_TIMEOUT_MS', problems);
+  const openaiTimeoutMs = readInt(env.OPENAI_TIMEOUT_MS, 15000, 1000, 60000, 'OPENAI_TIMEOUT_MS', problems);
+
+  const openaiApiKey = (env.OPENAI_API_KEY || '').trim() || null;
+  const openaiModel = (env.OPENAI_MODEL || '').trim() || 'gpt-4o-mini';
+  if (!/^[A-Za-z0-9._:-]{1,100}$/.test(openaiModel)) {
+    problems.push('OPENAI_MODEL must be a valid model identifier (1-100 letters, numbers, ., _, :, or -).');
+  }
 
   const host = env.HOST || '127.0.0.1';
   const publicBaseUrl = (env.PUBLIC_BASE_URL || `http://${host === '0.0.0.0' ? '127.0.0.1' : host}:${port}`).trim().replace(/\/+$/, '');
@@ -58,6 +65,9 @@ function loadConfig(env = process.env) {
     paypalTimeoutMs,
     forwardTimeoutMs,
     probeSettleMs,
+    openaiApiKey,
+    openaiModel,
+    openaiTimeoutMs,
   };
 }
 

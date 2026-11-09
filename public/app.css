@@ -230,21 +230,17 @@ button, input, select, textarea { font: inherit; color: inherit; }
 .wordmark {
   display: inline-flex;
   align-items: center;
-  gap: 10px;
+  gap: 9px;
   color: #fff;
-  font-size: 20px;
+  font-size: 15px;
   font-weight: 800;
-  letter-spacing: -.045em;
+  letter-spacing: .095em;
 }
-.wordmark::before {
-  width: 13px;
-  height: 13px;
-  content: "";
-  display: inline-block;
-  border-radius: 50% 50% 50% 12%;
-  background: linear-gradient(140deg, #ff4a36 10%, #cf1021 76%);
-  transform: rotate(-35deg);
-  box-shadow: 0 0 20px rgba(238, 46, 34, .4);
+.brand-mark {
+  display: block;
+  width: 29px;
+  height: 29px;
+  filter: drop-shadow(0 0 10px rgba(238, 46, 34, .25));
 }
 .env-tag {
   padding: 4px 10px;
@@ -480,7 +476,8 @@ details.raw-wrap summary { padding: 5px 0; }
 }
 @media (max-width: 520px) {
   .topbar { gap: 9px; }
-  .wordmark { font-size: 18px; }
+  .wordmark { font-size: 14px; }
+  .brand-mark { width: 26px; height: 26px; }
   .env-tag { font-size: 9px; padding: 3px 7px; }
   .title-row { align-items: flex-start; }
   .title-row .actions { width: 100%; margin-left: 0; }
