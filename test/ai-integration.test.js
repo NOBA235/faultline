@@ -174,12 +174,12 @@ test('[fixture] AI suggestions reflect actual stored events and runs, and secret
   assert.ok(sug.suggestions.length >= 2);
   assert.ok(sug.suggestions.every((s) => s.eventId === eventId && s.paypalEventId === 'WH-SUG-77'));
 
-  // Request OpenAI-generated follow-up suggestions via POST:
+  // Request Gemini-generated follow-up suggestions via POST:
   const aiSugRes = await t.request('POST', `/api/projects/${pid}/ai/suggestions`, {});
   assert.equal(aiSugRes.status, 200);
   const aiSug = aiSugRes.json;
-  assert.equal(aiSug.source, 'openai');
-  assert.equal(aiSug.provider, 'openai:gpt-4o-mini');
+  assert.equal(aiSug.source, 'gemini');
+  assert.equal(aiSug.provider, 'gemini:gemini-3.8-flash');
   assert.equal(aiSug.insufficientEvidence, false);
   assert.ok(aiSug.suggestions.length >= 1);
   assert.ok(aiSug.suggestions.every((s) => s.eventId === eventId));
@@ -190,28 +190,28 @@ test('[fixture] AI suggestions reflect actual stored events and runs, and secret
   assert.equal((await fetch(`${t.base}/api/projects/${pid}/ai/status`)).status, 401);
   const otherPid = (await t.request('POST', '/api/projects', goodProject({ name: 'Second project' }))).json.project.id;
   const plan = (await t.request('POST', `/api/projects/${pid}/ai/plans`, { prompt: 'Drop the completed payment webhook' })).json.plan;
-  assert.equal(plan.provider, 'openai:gpt-4o-mini');
+  assert.equal(plan.provider, 'gemini:gemini-3.8-flash');
   assert.equal((await t.request('GET', `/api/projects/${otherPid}/ai/plans/${plan.id}`)).status, 404);
 
-  // Verify no secrets, tokens, or encryption keys appear anywhere in AI tables, responses, or OpenAI calls:
+  // Verify no secrets, tokens, or encryption keys appear anywhere in AI tables, responses, or model calls:
   const dump = JSON.stringify({
     sug,
     aiSug,
     plan,
-    openAiCalls: t.mockOpenAI.calls,
+    modelCalls: t.mockAi.calls,
     dbPlans: t.db.prepare('SELECT * FROM ai_test_plans').all(),
     dbAnalyses: t.db.prepare('SELECT * FROM ai_run_analyses').all(),
   });
-  assert.ok(!dump.includes(GOOD_SECRET), 'PayPal secret must never appear in AI data or OpenAI requests');
-  assert.ok(!/fixture-token-\d+/.test(dump), 'OAuth access token must never appear in AI data or OpenAI requests');
-  assert.ok(!dump.includes(t.config.encryptionKey), 'ENCRYPTION_KEY must never appear in AI data or OpenAI requests');
-  assert.ok(!dump.includes(t.config.sessionSecret), 'SESSION_SECRET must never appear in AI data or OpenAI requests');
+  assert.ok(!dump.includes(GOOD_SECRET), 'PayPal secret must never appear in AI data or model requests');
+  assert.ok(!/fixture-token-\d+/.test(dump), 'OAuth access token must never appear in AI data or model requests');
+  assert.ok(!dump.includes(t.config.encryptionKey), 'ENCRYPTION_KEY must never appear in AI data or model requests');
+  assert.ok(!dump.includes(t.config.sessionSecret), 'SESSION_SECRET must never appear in AI data or model requests');
 
-  // Verify raw webhook payloads, signature headers, and resource IDs are never sent to OpenAI:
-  const openAiDump = JSON.stringify(t.mockOpenAI.calls);
-  assert.ok(!openAiDump.includes('FIXTURE-VALID-SIG'), 'Webhook signature header must never be sent to OpenAI');
-  assert.ok(!openAiDump.includes('FXCAP-AI-1'), 'Resource ID / raw body must never be sent to OpenAI');
-  assert.ok(!openAiDump.includes('10.10'), 'Raw webhook payment amount payload must never be sent to OpenAI');
+  // Verify raw webhook payloads, signature headers, and resource IDs are never sent to model:
+  const modelDump = JSON.stringify(t.mockAi.calls);
+  assert.ok(!modelDump.includes('FIXTURE-VALID-SIG'), 'Webhook signature header must never be sent to model');
+  assert.ok(!modelDump.includes('FXCAP-AI-1'), 'Resource ID / raw body must never be sent to model');
+  assert.ok(!modelDump.includes('10.10'), 'Raw webhook payment amount payload must never be sent to model');
 
   // Deleting the project cascades and removes AI plans and analyses:
   await t.request('DELETE', `/api/projects/${pid}`);
@@ -219,14 +219,15 @@ test('[fixture] AI suggestions reflect actual stored events and runs, and secret
   assert.equal(t.db.prepare('SELECT COUNT(*) AS n FROM ai_run_analyses WHERE project_id = ?').get(pid).n, 0);
 });
 
-test('[fixture] missing OpenAI configuration allows app to start and returns 503 ai_not_configured with clear setup guidance', async () => {
+test('[fixture] missing AI configuration allows app to start and returns 503 ai_not_configured with clear setup guidance', async () => {
   await setup({ idempotent: true }, { testAppOpts: { aiConfigured: false } });
   const { eventId } = await receive(capEvent({ id: 'WH-NO-AI-1' }));
 
   const st = await t.request('GET', `/api/projects/${pid}/ai/status`);
   assert.equal(st.status, 200);
   assert.equal(st.json.configured, false);
-  assert.equal(st.json.provider, 'openai');
+  assert.equal(st.json.provider, null);
+  assert.match(st.json.setupInstructions, /GEMINI_API_KEY/);
   assert.match(st.json.setupInstructions, /OPENAI_API_KEY/);
 
   const planRes = await t.request('POST', `/api/projects/${pid}/ai/plans`, {
@@ -234,7 +235,7 @@ test('[fixture] missing OpenAI configuration allows app to start and returns 503
   });
   assert.equal(planRes.status, 503);
   assert.equal(planRes.json.error.code, 'ai_not_configured');
-  assert.match(planRes.json.error.message, /OPENAI_API_KEY/);
+  assert.match(planRes.json.error.message, /GEMINI_API_KEY/);
 
   const started = await t.request('POST', `/api/projects/${pid}/events/${eventId}/scenarios`, {
     kind: 'forward',
@@ -257,6 +258,29 @@ test('[fixture] missing OpenAI configuration allows app to start and returns 503
   assert.equal(sugGet.json.aiConfigured, false);
   assert.equal(sugGet.json.source, 'deterministic_coverage');
   assert.equal(sugGet.json.provider, null);
+});
+
+test('[fixture] dual provider: switching to OpenAI via aiProvider: "openai" works seamlessly', async () => {
+  await setup({ idempotent: true }, { testAppOpts: { aiProvider: 'openai' } });
+  const { eventId } = await receive(capEvent({ id: 'WH-OAI-1' }));
+
+  const st = await t.request('GET', `/api/projects/${pid}/ai/status`);
+  assert.equal(st.status, 200);
+  assert.equal(st.json.configured, true);
+  assert.equal(st.json.provider, 'openai');
+  assert.equal(st.json.model, 'gpt-4o-mini');
+  assert.equal(st.json.providerTitle, 'OpenAI');
+
+  const created = await t.request('POST', `/api/projects/${pid}/ai/plans`, {
+    prompt: 'Test whether my application processes the same completed payment webhook twice.',
+  });
+  assert.equal(created.status, 201);
+  assert.equal(created.json.plan.provider, 'openai:gpt-4o-mini');
+
+  const aiSugRes = await t.request('POST', `/api/projects/${pid}/ai/suggestions`, {});
+  assert.equal(aiSugRes.status, 200);
+  assert.equal(aiSugRes.json.source, 'openai');
+  assert.equal(aiSugRes.json.provider, 'openai:gpt-4o-mini');
 });
 
 test('[fixture] invalid model outputs, timeouts, provider errors, prompt injections, and financial/verdict boundaries are strictly enforced', async () => {

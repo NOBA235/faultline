@@ -423,12 +423,176 @@ test('strict schema validators reject invalid model plans, analyses, and suggest
   );
 });
 
-test('createAiProvider reports unconfigured state without key and maps timeouts/errors safely', async () => {
-  const unconfigured = createAiProvider({ apiKey: null, model: 'gpt-4o-mini', timeoutMs: 1000 });
+test('createAiProvider reports unconfigured state without key and gives clear instructions', async () => {
+  const unconfigured = createAiProvider({ timeoutMs: 1000 });
   assert.equal(unconfigured.isConfigured(), false);
   assert.equal(unconfigured.status().configured, false);
+  assert.equal(unconfigured.providerName, 'none');
+  assert.match(unconfigured.status().setupInstructions, /GEMINI_API_KEY/);
   await assert.rejects(
     () => unconfigured.generateTestPlan({ prompt: 'Test duplicate delivery', allowlistedContext: {} }),
     (err) => err.status === 503 && err.code === 'ai_not_configured'
+  );
+});
+
+test('createAiProvider supports Google Gemini provider with strict JSON output', async () => {
+  const mockCalls = [];
+  const fakeGeminiClient = {
+    models: {
+      generateContent: async (params) => {
+        mockCalls.push(params);
+        return {
+          text: () => JSON.stringify({
+            objective: 'Test duplicate delivery with Gemini.',
+            requiredEventType: 'PAYMENT.CAPTURE.COMPLETED',
+            requiredVerificationStatus: 'verified',
+            matchedEventId: null,
+            scenario: { kind: 'duplicate', params: { count: 2, mode: 'sequential' } },
+            expectedBehavior: 'Processed once.',
+            assertions: ['idempotent_processing'],
+            failureConditions: ['Processed twice'],
+            financialOperationsAllowed: false,
+          }),
+        };
+      },
+    },
+  };
+
+  const provider = createAiProvider({
+    provider: 'gemini',
+    geminiModel: 'gemini-3.8-flash',
+    client: fakeGeminiClient,
+  });
+
+  assert.equal(provider.isConfigured(), true);
+  assert.equal(provider.providerName, 'gemini');
+  assert.equal(provider.providerTitle, 'Google Gemini');
+  assert.equal(provider.modelName, 'gemini-3.8-flash');
+
+  const plan = await provider.generateTestPlan({
+    prompt: 'Send duplicate payment webhooks',
+    allowlistedContext: { verifiedEvents: [] },
+  });
+  assert.equal(plan.objective, 'Test duplicate delivery with Gemini.');
+  assert.equal(mockCalls.length, 1);
+  assert.equal(mockCalls[0].model, 'gemini-3.8-flash');
+  assert.equal(mockCalls[0].config.responseMimeType, 'application/json');
+});
+
+test('createAiProvider supports OpenAI provider with json_object response format', async () => {
+  const mockCalls = [];
+  const fakeOpenAiClient = {
+    chat: {
+      completions: {
+        create: async (params) => {
+          mockCalls.push(params);
+          return {
+            choices: [
+              {
+                message: {
+                  content: JSON.stringify({
+                    objective: 'Test duplicate delivery with OpenAI.',
+                    requiredEventType: 'PAYMENT.CAPTURE.COMPLETED',
+                    requiredVerificationStatus: 'verified',
+                    matchedEventId: null,
+                    scenario: { kind: 'duplicate', params: { count: 3, mode: 'sequential' } },
+                    expectedBehavior: 'Processed once.',
+                    assertions: ['idempotent_processing'],
+                    failureConditions: ['Processed thrice'],
+                    financialOperationsAllowed: false,
+                  }),
+                },
+              },
+            ],
+          };
+        },
+      },
+    },
+  };
+
+  const provider = createAiProvider({
+    provider: 'openai',
+    openaiModel: 'gpt-4o-mini',
+    client: fakeOpenAiClient,
+  });
+
+  assert.equal(provider.isConfigured(), true);
+  assert.equal(provider.providerName, 'openai');
+  assert.equal(provider.providerTitle, 'OpenAI');
+  assert.equal(provider.modelName, 'gpt-4o-mini');
+
+  const plan = await provider.generateTestPlan({
+    prompt: 'Send duplicate payment webhooks',
+    allowlistedContext: { verifiedEvents: [] },
+  });
+  assert.equal(plan.objective, 'Test duplicate delivery with OpenAI.');
+  assert.equal(mockCalls.length, 1);
+  assert.equal(mockCalls[0].model, 'gpt-4o-mini');
+  assert.deepEqual(mockCalls[0].response_format, { type: 'json_object' });
+});
+
+test('createAiProvider maps provider errors, timeouts, rate limits, and oversized inputs safely', async () => {
+  // 1. Quota / rate limit (429)
+  const rateLimitClient = {
+    models: {
+      generateContent: async () => {
+        const err = new Error('Resource has been exhausted (e.g. check quota)');
+        err.status = 429;
+        throw err;
+      },
+    },
+  };
+  const rlProvider = createAiProvider({ provider: 'gemini', client: rateLimitClient });
+  await assert.rejects(
+    () => rlProvider.generateTestPlan({ prompt: 'test', allowlistedContext: {} }),
+    (err) => err.status === 429 && err.code === 'ai_rate_limited'
+  );
+
+  // 2. Authentication / API key rejection (401/403)
+  const authErrClient = {
+    models: {
+      generateContent: async () => {
+        const err = new Error('API key not valid');
+        err.status = 400;
+        throw err;
+      },
+    },
+  };
+  const authProvider = createAiProvider({ provider: 'gemini', client: authErrClient });
+  await assert.rejects(
+    () => authProvider.generateTestPlan({ prompt: 'test', allowlistedContext: {} }),
+    (err) => err.status === 502 && err.code === 'ai_provider_error' && /GEMINI_API_KEY/.test(err.message)
+  );
+
+  // 3. Timeout / Abort
+  const timeoutClient = {
+    models: {
+      generateContent: async () => {
+        const err = new Error('Request was aborted');
+        err.name = 'AbortError';
+        throw err;
+      },
+    },
+  };
+  const toProvider = createAiProvider({ provider: 'gemini', client: timeoutClient });
+  await assert.rejects(
+    () => toProvider.generateTestPlan({ prompt: 'test', allowlistedContext: {} }),
+    (err) => err.status === 504 && err.code === 'ai_timeout'
+  );
+
+  // 4. Input exceeding MAX_INPUT_CHARS
+  const validClient = { models: { generateContent: async () => ({ text: () => '{}' }) } };
+  const prov = createAiProvider({ provider: 'gemini', client: validClient });
+  await assert.rejects(
+    () => prov.generateTestPlan({ prompt: 'x'.repeat(20000), allowlistedContext: {} }),
+    (err) => err.status === 413 && err.code === 'ai_input_too_large'
+  );
+
+  // 5. Non-JSON response
+  const nonJsonClient = { models: { generateContent: async () => ({ text: () => 'Not a JSON text' }) } };
+  const njProvider = createAiProvider({ provider: 'gemini', client: nonJsonClient });
+  await assert.rejects(
+    () => njProvider.generateTestPlan({ prompt: 'test', allowlistedContext: {} }),
+    (err) => err.status === 502 && err.code === 'ai_invalid_output'
   );
 });

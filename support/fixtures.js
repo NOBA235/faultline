@@ -236,130 +236,164 @@ function startFixtureApp(opts = {}) {
 const ADMIN_PASSWORD = 'test-admin-password-123';
 
 // ---------------------------------------------------------------------------
-// TEST FIXTURE: an offline, injected mock for the official OpenAI SDK client.
+// TEST FIXTURES: offline, injected mocks for Google Gemini API and OpenAI.
 // Records every model invocation so tests can assert secret/data minimization,
 // schema validation, timeout handling, and deterministic verdict immutability
-// without requiring a real OPENAI_API_KEY or making external network calls.
+// without requiring real API keys or making external network calls.
 // ---------------------------------------------------------------------------
-function createMockOpenAIClient(opts = {}) {
-  const calls = [];
-  let customHandler = opts.handler || null;
+function mockAiResponder(sys, usr) {
+  if (sys.includes('Faultline AI Test Planner')) {
+    const promptMatch = usr.match(/<untrusted_developer_request>\n([\s\S]*?)\n<\/untrusted_developer_request>/);
+    const ctxMatch = usr.match(/<allowlisted_event_metadata>\n([\s\S]*?)\n<\/allowlisted_event_metadata>/);
+    const promptText = promptMatch ? promptMatch[1] : '';
+    const ctx = ctxMatch ? JSON.parse(ctxMatch[1]) : { verifiedEvents: [], probeConfigured: false };
+    const mappedEvents = (ctx.verifiedEvents || []).map((e) => ({
+      id: e.id,
+      paypal_event_id: e.paypalEventId,
+      event_type: e.eventType,
+      resource_type: e.resourceType,
+      paypal_event_created_at: e.paypalEventCreatedAt,
+      processing_status: e.processingStatus,
+    }));
+    try {
+      const planned = planFromPrompt(promptText, {
+        verifiedEvents: mappedEvents,
+        selectedEventId: ctx.selectedEventId,
+        probeConfigured: ctx.probeConfigured,
+      });
+      return {
+        objective: planned.spec.objective,
+        requiredEventType: planned.spec.requiredSourceEvent.eventType,
+        requiredVerificationStatus: 'verified',
+        matchedEventId: planned.matchedEventId,
+        scenario: {
+          kind: planned.spec.scenario.kind,
+          params: planned.spec.scenario.params,
+        },
+        expectedBehavior: planned.spec.expectedBehavior,
+        assertions: planned.spec.assertions.map((a) => a.id),
+        failureConditions: planned.spec.failureConditions,
+        financialOperationsAllowed: false,
+      };
+    } catch (err) {
+      return { refusal: err.message || 'Unrecognized or unsafe request.' };
+    }
+  }
 
-  function defaultResponder(params) {
-    const sys = (params.messages.find((m) => m.role === 'system') || {}).content || '';
-    const usr = (params.messages.find((m) => m.role === 'user') || {}).content || '';
+  if (sys.includes('Faultline AI Run Analyzer')) {
+    const traceMatch = usr.match(/<allowlisted_execution_trace>\n([\s\S]*?)\n<\/allowlisted_execution_trace>/);
+    const safeTrace = traceMatch ? JSON.parse(traceMatch[1]) : {};
+    const baseline = analyzeRun({
+      ...safeTrace,
+      run: { ...safeTrace.run, destination: 'https://endpoint.test/webhooks' },
+    });
+    return {
+      whatWasExpected: baseline.whatWasExpected,
+      whereFailureOccurred: baseline.whereFailureOccurred,
+      whyItMatters: baseline.whyItMatters,
+      whatToInvestigate: baseline.whatToInvestigate,
+      remediation: baseline.remediation,
+      recommendations: baseline.recommendations,
+    };
+  }
 
-    if (sys.includes('Faultline AI Test Planner')) {
-      const promptMatch = usr.match(/<untrusted_developer_request>\n([\s\S]*?)\n<\/untrusted_developer_request>/);
-      const ctxMatch = usr.match(/<allowlisted_event_metadata>\n([\s\S]*?)\n<\/allowlisted_event_metadata>/);
-      const promptText = promptMatch ? promptMatch[1] : '';
-      const ctx = ctxMatch ? JSON.parse(ctxMatch[1]) : { verifiedEvents: [], probeConfigured: false };
-      const mappedEvents = (ctx.verifiedEvents || []).map((e) => ({
+  if (sys.includes('Faultline AI Follow-Up Test Advisor')) {
+    const evMatch = usr.match(/<allowlisted_project_evidence>\n([\s\S]*?)\n<\/allowlisted_project_evidence>/);
+    const safeEv = evMatch ? JSON.parse(evMatch[1]) : {};
+    const mapped = suggestTests({
+      project: {
+        probeUrl: safeEv.probeConfigured ? 'http://probe.local/probe' : null,
+        paypalWebhookId: safeEv.webhookIdConfigured ? 'WHID' : null,
+        forwardMode: safeEv.forwardMode || 'manual',
+      },
+      verifiedEvents: (safeEv.verifiedEvents || []).map((e) => ({
         id: e.id,
         paypal_event_id: e.paypalEventId,
         event_type: e.eventType,
         resource_type: e.resourceType,
         paypal_event_created_at: e.paypalEventCreatedAt,
         processing_status: e.processingStatus,
-      }));
-      try {
-        const planned = planFromPrompt(promptText, {
-          verifiedEvents: mappedEvents,
-          selectedEventId: ctx.selectedEventId,
-          probeConfigured: ctx.probeConfigured,
-        });
-        return {
-          objective: planned.spec.objective,
-          requiredEventType: planned.spec.requiredSourceEvent.eventType,
-          requiredVerificationStatus: 'verified',
-          matchedEventId: planned.matchedEventId,
-          scenario: {
-            kind: planned.spec.scenario.kind,
-            params: planned.spec.scenario.params,
-          },
-          expectedBehavior: planned.spec.expectedBehavior,
-          assertions: planned.spec.assertions.map((a) => a.id),
-          failureConditions: planned.spec.failureConditions,
-          financialOperationsAllowed: false,
-        };
-      } catch (err) {
-        return { refusal: err.message || 'Unrecognized or unsafe request.' };
-      }
-    }
-
-    if (sys.includes('Faultline AI Run Analyzer')) {
-      const traceMatch = usr.match(/<allowlisted_execution_trace>\n([\s\S]*?)\n<\/allowlisted_execution_trace>/);
-      const safeTrace = traceMatch ? JSON.parse(traceMatch[1]) : {};
-      const baseline = analyzeRun({
-        ...safeTrace,
-        run: { ...safeTrace.run, destination: 'https://endpoint.test/webhooks' },
-      });
-      return {
-        whatWasExpected: baseline.whatWasExpected,
-        whereFailureOccurred: baseline.whereFailureOccurred,
-        whyItMatters: baseline.whyItMatters,
-        whatToInvestigate: baseline.whatToInvestigate,
-        remediation: baseline.remediation,
-        recommendations: baseline.recommendations,
-      };
-    }
-
-    if (sys.includes('Faultline AI Follow-Up Test Advisor')) {
-      const evMatch = usr.match(/<allowlisted_project_evidence>\n([\s\S]*?)\n<\/allowlisted_project_evidence>/);
-      const safeEv = evMatch ? JSON.parse(evMatch[1]) : {};
-      const mapped = suggestTests({
-        project: {
-          probeUrl: safeEv.probeConfigured ? 'http://probe.local/probe' : null,
-          paypalWebhookId: safeEv.webhookIdConfigured ? 'WHID' : null,
-          forwardMode: safeEv.forwardMode || 'manual',
-        },
-        verifiedEvents: (safeEv.verifiedEvents || []).map((e) => ({
-          id: e.id,
-          paypal_event_id: e.paypalEventId,
-          event_type: e.eventType,
-          resource_type: e.resourceType,
-          paypal_event_created_at: e.paypalEventCreatedAt,
-          processing_status: e.processingStatus,
-          related_order_id: e.hasRelatedOrder ? 'ord-shared' : null,
-        })),
-        unverifiedEvents: [],
-        runs: (safeEv.runs || []).map((r) => ({
-          id: r.id,
-          event_id: r.eventId,
-          kind: r.kind,
-          params: r.params,
-          status: r.status,
-          verdict: r.verdict,
-        })),
-        failedAssertions: (safeEv.failedAssertions || []).map((f) => ({
-          run_id: f.runId,
-          event_id: f.eventId,
-          check_id: f.checkId,
-          name: f.name,
-          summary: f.summary,
-        })),
-        neverEvaluatedChecks: (safeEv.neverEvaluatedChecks || []).map((c) => ({
-          check_id: c.checkId,
-          name: c.name,
-        })),
-      });
-      return {
-        summary: mapped.summary,
-        suggestions: mapped.suggestions.map((s) => ({
-          id: s.id,
-          priority: s.priority,
-          title: s.title,
-          rationale: s.rationale,
-          basedOn: s.basedOn,
-          eventId: s.eventId,
-          scenario: { kind: s.scenario.kind, params: s.scenario.params },
-          targetChecks: s.targetChecks,
-        })),
-      };
-    }
-
-    return {};
+        related_order_id: e.hasRelatedOrder ? 'ord-shared' : null,
+      })),
+      unverifiedEvents: [],
+      runs: (safeEv.runs || []).map((r) => ({
+        id: r.id,
+        event_id: r.eventId,
+        kind: r.kind,
+        params: r.params,
+        status: r.status,
+        verdict: r.verdict,
+      })),
+      failedAssertions: (safeEv.failedAssertions || []).map((f) => ({
+        run_id: f.runId,
+        event_id: f.eventId,
+        check_id: f.checkId,
+        name: f.name,
+        summary: f.summary,
+      })),
+      neverEvaluatedChecks: (safeEv.neverEvaluatedChecks || []).map((c) => ({
+        check_id: c.checkId,
+        name: c.name,
+      })),
+    });
+    return {
+      summary: mapped.summary,
+      suggestions: mapped.suggestions.map((s) => ({
+        id: s.id,
+        priority: s.priority,
+        title: s.title,
+        rationale: s.rationale,
+        basedOn: s.basedOn,
+        eventId: s.eventId,
+        scenario: { kind: s.scenario.kind, params: s.scenario.params },
+        targetChecks: s.targetChecks,
+      })),
+    };
   }
+
+  return {};
+}
+
+function createMockGeminiClient(opts = {}) {
+  const calls = [];
+  let customHandler = opts.handler || null;
+
+  const client = {
+    models: {
+      generateContent: async (params, reqOpts = {}) => {
+        const sys = (params.config && params.config.systemInstruction) || '';
+        const usr = params.contents || '';
+        calls.push({
+          provider: 'gemini',
+          model: params.model,
+          config: params.config,
+          contents: params.contents,
+          systemPrompt: sys,
+          userPrompt: usr,
+        });
+        if (customHandler) {
+          const customResult = await customHandler(params, reqOpts);
+          if (typeof customResult === 'string') {
+            return { text: () => customResult };
+          }
+          return { text: () => JSON.stringify(customResult) };
+        }
+        const jsonObj = mockAiResponder(sys, usr);
+        return { text: () => JSON.stringify(jsonObj) };
+      },
+    },
+  };
+
+  return {
+    client,
+    calls,
+    setHandler: (fn) => { customHandler = fn; },
+  };
+}
+
+function createMockOpenAIClient(opts = {}) {
+  const calls = [];
+  let customHandler = opts.handler || null;
 
   const client = {
     chat: {
@@ -368,6 +402,7 @@ function createMockOpenAIClient(opts = {}) {
           const sys = (params.messages.find((m) => m.role === 'system') || {}).content || '';
           const usr = (params.messages.find((m) => m.role === 'user') || {}).content || '';
           calls.push({
+            provider: 'openai',
             model: params.model,
             temperature: params.temperature,
             max_completion_tokens: params.max_completion_tokens,
@@ -383,7 +418,7 @@ function createMockOpenAIClient(opts = {}) {
             }
             return { choices: [{ message: { content: JSON.stringify(customResult) } }] };
           }
-          const jsonObj = defaultResponder(params);
+          const jsonObj = mockAiResponder(sys, usr);
           return { choices: [{ message: { content: JSON.stringify(jsonObj) } }] };
         },
       },
@@ -406,22 +441,39 @@ async function startTestApp(fixtureUrl, timeoutMs = 400, opts = {}) {
     publicBaseUrl: 'http://127.0.0.1:3000',
     forwardTimeoutMs: 1500,
     probeSettleMs: 120,
+    aiProvider: opts.aiProvider || 'auto',
+    geminiModel: 'gemini-3.8-flash',
     openaiModel: 'gpt-4o-mini',
+    aiTimeoutMs: 1500,
     openaiTimeoutMs: 1500,
     ...(opts.config || {}),
   };
   const db = openDb(opts.dbFile || ':memory:');
-  const mockOpenAI = opts.mockOpenAI || createMockOpenAIClient(opts.aiOverrides || {});
+
+  const aiProviderName = opts.aiProvider || (opts.mockOpenAI ? 'openai' : 'gemini');
+  const mockAi = opts.mockAi || (aiProviderName === 'openai'
+    ? (opts.mockOpenAI || createMockOpenAIClient(opts.aiOverrides || {}))
+    : (opts.mockGemini || createMockGeminiClient(opts.aiOverrides || {})));
+
   const ai = opts.ai !== undefined
     ? opts.ai
     : opts.aiConfigured === false
-      ? createAiProvider({ apiKey: null, model: config.openaiModel, timeoutMs: config.openaiTimeoutMs })
+      ? createAiProvider({
+        provider: aiProviderName,
+        geminiApiKey: null,
+        openaiApiKey: null,
+        geminiModel: config.geminiModel,
+        openaiModel: config.openaiModel,
+        timeoutMs: config.aiTimeoutMs,
+      })
       : createAiProvider({
-        apiKey: null,
-        model: config.openaiModel,
-        timeoutMs: config.openaiTimeoutMs,
-        client: mockOpenAI.client,
+        provider: aiProviderName,
+        geminiModel: config.geminiModel,
+        openaiModel: config.openaiModel,
+        timeoutMs: config.aiTimeoutMs,
+        client: mockAi.client,
       });
+
   const app = createApp({ config, db, paypal: new PayPalClient({ baseUrl: fixtureUrl, timeoutMs }), ai });
   const server = await new Promise((r) => { const s = app.listen(0, '127.0.0.1', () => r(s)); });
   const base = `http://127.0.0.1:${server.address().port}`;
@@ -443,7 +495,18 @@ async function startTestApp(fixtureUrl, timeoutMs = 400, opts = {}) {
     cookie = res.headers.get('set-cookie').split(';')[0];
     return res;
   }
-  return { base, db, config, request, login, app, mockOpenAI, close: () => new Promise((r) => { app.locals.shutdown(); server.closeAllConnections(); server.close(() => { db.close(); r(); }); }) };
+  return {
+    base,
+    db,
+    config,
+    request,
+    login,
+    app,
+    mockAi,
+    mockOpenAI: mockAi,
+    mockGemini: mockAi,
+    close: () => new Promise((r) => { app.locals.shutdown(); server.closeAllConnections(); server.close(() => { db.close(); r(); }); }),
+  };
 }
 
 const goodProject = (over = {}) => ({
@@ -454,4 +517,4 @@ const goodProject = (over = {}) => ({
   ...over,
 });
 
-module.exports = { startFixturePayPal, startFixtureDestination, startFixtureApp, startTestApp, createMockOpenAIClient, goodProject, GOOD_ID, GOOD_SECRET, BAD_SECRET, SLOW_ID, ADMIN_PASSWORD };
+module.exports = { startFixturePayPal, startFixtureDestination, startFixtureApp, startTestApp, createMockGeminiClient, createMockOpenAIClient, goodProject, GOOD_ID, GOOD_SECRET, BAD_SECRET, SLOW_ID, ADMIN_PASSWORD };

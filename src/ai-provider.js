@@ -1,5 +1,6 @@
 'use strict';
 const OpenAI = require('openai');
+const { GoogleGenAI } = require('@google/genai');
 const { ApiError } = require('./errors');
 
 const MAX_INPUT_CHARS = 16000;
@@ -101,64 +102,115 @@ const SUGGEST_SYSTEM_PROMPT = [
   '}',
 ].join('\n');
 
-function mapProviderError(err, timeoutMs) {
+function mapProviderError(err, timeoutMs, providerTitle = 'AI') {
   if (err instanceof ApiError) return err;
   const name = (err && err.name) || '';
   const status = err && typeof err.status === 'number' ? err.status : null;
   const code = (err && err.code) || '';
+  const msg = (err && err.message) || '';
 
   if (
     name === 'APIConnectionTimeoutError' ||
     name === 'AbortError' ||
     code === 'ETIMEDOUT' ||
-    /timed?\s*out|abort/i.test((err && err.message) || '')
+    /timed?\s*out|abort/i.test(msg)
   ) {
     return new ApiError(
       504,
       'ai_timeout',
-      `The OpenAI model request timed out after ${timeoutMs} ms. Try again or increase OPENAI_TIMEOUT_MS in .env.`
+      `The ${providerTitle} model request timed out after ${timeoutMs} ms. Try again or increase AI_TIMEOUT_MS in .env.`
     );
   }
-  if (status === 429) {
+  if (status === 429 || /resource_exhausted|quota/i.test(msg)) {
     return new ApiError(
       429,
       'ai_rate_limited',
-      'OpenAI rate limit or quota reached (HTTP 429). Wait a moment or check your OpenAI billing/quota settings.'
+      `${providerTitle} rate limit or quota reached (HTTP 429). Wait a moment or check your billing/quota settings.`
     );
   }
-  if (status === 401 || status === 403) {
+  if (status === 401 || status === 403 || (status === 400 && /API key/i.test(msg))) {
+    const keyHint = providerTitle === 'Google Gemini' ? 'GEMINI_API_KEY' : 'OPENAI_API_KEY';
     return new ApiError(
       502,
       'ai_provider_error',
-      'OpenAI rejected the server API key (HTTP 401/403). Verify OPENAI_API_KEY in your server .env file and restart Faultline.'
+      `${providerTitle} rejected the server API key. Verify ${keyHint} in your server .env file and restart Faultline.`
     );
   }
   return new ApiError(
     502,
     'ai_provider_error',
-    'The OpenAI model service could not complete the request. Verify OPENAI_API_KEY, OPENAI_MODEL, and network connectivity.'
+    `The ${providerTitle} model service could not complete the request. Verify your API key, model setting, and network connectivity.`
   );
 }
 
-function createAiProvider({ apiKey = null, model = 'gpt-4o-mini', timeoutMs = 15000, client = null } = {}) {
-  const cleanKey = typeof apiKey === 'string' && apiKey.trim() ? apiKey.trim() : null;
-  const cleanModel = typeof model === 'string' && model.trim() ? model.trim() : 'gpt-4o-mini';
-  const configured = Boolean(cleanKey || client);
+function createAiProvider({
+  provider = 'auto',
+  geminiApiKey = null,
+  geminiModel = 'gemini-3.8-flash',
+  openaiApiKey = null,
+  openaiModel = 'gpt-4o-mini',
+  timeoutMs = 15000,
+  client = null,
+} = {}) {
+  const cleanGeminiKey = typeof geminiApiKey === 'string' && geminiApiKey.trim() ? geminiApiKey.trim() : null;
+  const cleanGeminiModel = typeof geminiModel === 'string' && geminiModel.trim() ? geminiModel.trim() : 'gemini-3.8-flash';
+  const cleanOpenAiKey = typeof openaiApiKey === 'string' && openaiApiKey.trim() ? openaiApiKey.trim() : null;
+  const cleanOpenAiModel = typeof openaiModel === 'string' && openaiModel.trim() ? openaiModel.trim() : 'gpt-4o-mini';
 
-  const sdkClient = client || (cleanKey
-    ? new OpenAI({
-      apiKey: cleanKey,
-      timeout: timeoutMs,
-      maxRetries: 0,
-    })
-    : null);
+  let activeProvider = null;
+  let activeModel = null;
+  let providerTitle = null;
+  let sdkClient = null;
+
+  if (client) {
+    if (provider === 'openai' || (!provider.includes('gemini') && client.chat && client.chat.completions)) {
+      activeProvider = 'openai';
+      activeModel = cleanOpenAiModel;
+      providerTitle = 'OpenAI';
+      sdkClient = client;
+    } else {
+      activeProvider = 'gemini';
+      activeModel = cleanGeminiModel;
+      providerTitle = 'Google Gemini';
+      sdkClient = client;
+    }
+  } else if (provider === 'gemini') {
+    if (cleanGeminiKey) {
+      activeProvider = 'gemini';
+      activeModel = cleanGeminiModel;
+      providerTitle = 'Google Gemini';
+      sdkClient = new GoogleGenAI({ apiKey: cleanGeminiKey, httpOptions: { timeout: timeoutMs } });
+    }
+  } else if (provider === 'openai') {
+    if (cleanOpenAiKey) {
+      activeProvider = 'openai';
+      activeModel = cleanOpenAiModel;
+      providerTitle = 'OpenAI';
+      sdkClient = new OpenAI({ apiKey: cleanOpenAiKey, timeout: timeoutMs, maxRetries: 0 });
+    }
+  } else {
+    // 'auto': prioritize Gemini if key is provided; otherwise OpenAI
+    if (cleanGeminiKey) {
+      activeProvider = 'gemini';
+      activeModel = cleanGeminiModel;
+      providerTitle = 'Google Gemini';
+      sdkClient = new GoogleGenAI({ apiKey: cleanGeminiKey, httpOptions: { timeout: timeoutMs } });
+    } else if (cleanOpenAiKey) {
+      activeProvider = 'openai';
+      activeModel = cleanOpenAiModel;
+      providerTitle = 'OpenAI';
+      sdkClient = new OpenAI({ apiKey: cleanOpenAiKey, timeout: timeoutMs, maxRetries: 0 });
+    }
+  }
+
+  const configured = Boolean(activeProvider && sdkClient);
 
   function ensureConfigured() {
     if (!configured || !sdkClient) {
       throw new ApiError(
         503,
         'ai_not_configured',
-        'AI features are unavailable because OPENAI_API_KEY is not configured on the server. Add OPENAI_API_KEY (and optional OPENAI_MODEL, default gpt-4o-mini) to your .env file and restart Faultline. All PayPal Sandbox operations, Test Lab scenarios, and deterministic checks work without an AI key.'
+        'AI features are unavailable because neither GEMINI_API_KEY nor OPENAI_API_KEY is configured on the server. Add GEMINI_API_KEY (default model: gemini-3.8-flash) or OPENAI_API_KEY (default model: gpt-4o-mini) to your .env file and restart Faultline. All PayPal Sandbox operations, Test Lab scenarios, and deterministic checks work without an AI key.'
       );
     }
   }
@@ -171,74 +223,88 @@ function createAiProvider({ apiKey = null, model = 'gpt-4o-mini', timeoutMs = 15
 
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(new Error('AI request timed out')), timeoutMs);
-    let response;
+    let rawText = '';
+
     try {
-      response = await sdkClient.chat.completions.create(
-        {
-          model: cleanModel,
-          temperature: 0.1,
-          max_completion_tokens: MAX_COMPLETION_TOKENS,
-          response_format: { type: 'json_object' },
-          messages: [
-            { role: 'system', content: systemPrompt },
-            { role: 'user', content: userContent },
-          ],
-        },
-        {
-          timeout: timeoutMs,
-          signal: controller.signal,
-        }
-      );
+      if (activeProvider === 'gemini') {
+        const response = await sdkClient.models.generateContent({
+          model: activeModel,
+          contents: userContent,
+          config: {
+            systemInstruction: systemPrompt,
+            responseMimeType: 'application/json',
+            temperature: 0.1,
+            maxOutputTokens: MAX_COMPLETION_TOKENS,
+          },
+        });
+        rawText = (response && (typeof response.text === 'function' ? response.text() : response.text) || '').trim();
+      } else {
+        const response = await sdkClient.chat.completions.create(
+          {
+            model: activeModel,
+            temperature: 0.1,
+            max_completion_tokens: MAX_COMPLETION_TOKENS,
+            response_format: { type: 'json_object' },
+            messages: [
+              { role: 'system', content: systemPrompt },
+              { role: 'user', content: userContent },
+            ],
+          },
+          {
+            timeout: timeoutMs,
+            signal: controller.signal,
+          }
+        );
+        rawText = (response && response.choices && response.choices[0] && response.choices[0].message && response.choices[0].message.content || '').trim();
+      }
     } catch (err) {
-      throw mapProviderError(err, timeoutMs);
+      throw mapProviderError(err, timeoutMs, providerTitle || 'AI');
     } finally {
       clearTimeout(timer);
     }
 
-    const rawText = response
-      && Array.isArray(response.choices)
-      && response.choices[0]
-      && response.choices[0].message
-      && typeof response.choices[0].message.content === 'string'
-      ? response.choices[0].message.content.trim()
-      : '';
-
     if (!rawText) {
-      throw new ApiError(502, 'ai_invalid_output', 'The OpenAI model returned an empty response and was rejected.');
+      throw new ApiError(502, 'ai_invalid_output', `The ${providerTitle || 'AI'} model returned an empty response and was rejected.`);
     }
     if (rawText.length > MAX_OUTPUT_CHARS) {
-      throw new ApiError(502, 'ai_invalid_output', 'The OpenAI model response exceeded the maximum allowed output size and was rejected.');
+      throw new ApiError(502, 'ai_invalid_output', `The ${providerTitle || 'AI'} model response exceeded the maximum allowed output size and was rejected.`);
     }
 
     let parsed;
     try {
       parsed = JSON.parse(rawText);
     } catch {
-      throw new ApiError(502, 'ai_invalid_output', 'The OpenAI model did not return valid JSON and was rejected.');
+      throw new ApiError(502, 'ai_invalid_output', `The ${providerTitle || 'AI'} model did not return valid JSON and was rejected.`);
     }
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-      throw new ApiError(502, 'ai_invalid_output', 'The OpenAI model response must be a JSON object.');
+      throw new ApiError(502, 'ai_invalid_output', `The ${providerTitle || 'AI'} model response must be a JSON object.`);
     }
     return parsed;
   }
 
   return {
-    providerName: 'openai',
-    modelName: cleanModel,
-    providerLabel: `openai:${cleanModel}`,
+    providerName: activeProvider || 'none',
+    modelName: activeModel || null,
+    providerLabel: configured ? `${activeProvider}:${activeModel}` : null,
+    providerTitle: providerTitle || null,
     timeoutMs,
     isConfigured: () => configured,
     status: () => ({
       configured,
-      provider: 'openai',
-      model: cleanModel,
-      providerLabel: configured ? `openai:${cleanModel}` : null,
+      provider: activeProvider,
+      model: activeModel,
+      providerLabel: configured ? `${activeProvider}:${activeModel}` : null,
+      providerTitle: providerTitle || null,
+      availableProviders: {
+        gemini: { configured: Boolean(cleanGeminiKey), model: cleanGeminiModel },
+        openai: { configured: Boolean(cleanOpenAiKey), model: cleanOpenAiModel },
+      },
       timeoutMs,
       deterministicVerdictsOnly: true,
       financialOperationsAllowed: false,
       setupInstructions: configured
-        ? `OpenAI is configured using model "${cleanModel}". Deterministic checks in src/checks.js remain the sole source of test verdicts.`
-        : 'Set OPENAI_API_KEY (and optional OPENAI_MODEL, default gpt-4o-mini) in your server .env file and restart Faultline to enable AI test planning, trace explanations, and AI follow-up suggestions.',
+        ? `AI Test Engineer is active using ${providerTitle} (model: "${activeModel}"). Deterministic checks in src/checks.js remain the sole source of test verdicts.`
+        : 'Set GEMINI_API_KEY (default model: gemini-3.8-flash) or OPENAI_API_KEY (default model: gpt-4o-mini) in your server .env file and restart Faultline to enable AI test planning, trace explanations, and AI follow-up suggestions.',
     }),
 
     async generateTestPlan({ prompt, allowlistedContext }) {

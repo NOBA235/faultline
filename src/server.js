@@ -21,11 +21,12 @@ const app = createApp({ config, db, paypal });
 const server = app.listen(config.port, config.host, () => {
   console.log(`FAULTLINE listening on http://${config.host}:${config.port}`);
   console.log('PayPal environment: Sandbox (https://api-m.sandbox.paypal.com)');
-  console.log(
-    config.openaiApiKey
-      ? `AI Test Engineer: OpenAI configured (model: ${config.openaiModel})`
-      : 'AI Test Engineer: OpenAI disabled (set OPENAI_API_KEY in .env to enable AI planning and trace analysis)'
-  );
+  const activeAi = config.geminiApiKey && (config.aiProvider === 'auto' || config.aiProvider === 'gemini')
+    ? `Google Gemini (model: ${config.geminiModel})`
+    : config.openaiApiKey && (config.aiProvider === 'auto' || config.aiProvider === 'openai')
+      ? `OpenAI (model: ${config.openaiModel})`
+      : 'Disabled (set GEMINI_API_KEY or OPENAI_API_KEY in .env)';
+  console.log(`AI Test Engineer: ${activeAi}`);
 });
 
 function shutdown() {

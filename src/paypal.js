@@ -8,7 +8,7 @@ const ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 const asString = (v, max = 500) => (typeof v === 'string' ? v.slice(0, max) : null);
 
 class PayPalClient {
-  constructor({ baseUrl = SANDBOX_BASE_URL, timeoutMs = 10000 } = {}) {
+  constructor({ baseUrl = SANDBOX_BASE_URL, timeoutMs = 25000 } = {}) {
     this.baseUrl = baseUrl;
     this.timeoutMs = timeoutMs;
   }

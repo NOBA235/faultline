@@ -365,7 +365,7 @@ function registerAiRoutes({ app, db, config, forwarder, ai, requireAuth, wrap, g
       const empty = suggestTests(evidence);
       return res.json({
         ...empty,
-        source: 'openai',
+        source: ai.providerName || 'ai',
         provider: ai.providerLabel,
         aiConfigured: true,
       });
@@ -377,7 +377,7 @@ function registerAiRoutes({ app, db, config, forwarder, ai, requireAuth, wrap, g
 
     res.json({
       ...validated,
-      source: 'openai',
+      source: ai.providerName || 'ai',
       provider: ai.providerLabel,
       aiConfigured: true,
     });

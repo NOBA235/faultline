@@ -238,7 +238,7 @@
   function newProjectForm() {
     const f = {
       name: field({ id: 'name', label: 'Project name', hint: 'For example, Checkout service (staging).' }),
-      clientId: field({ id: 'clientId', label: 'Sandbox Client ID' }),
+      clientId: field({ id: 'clientId', label: 'Sandbox Client ID', type: 'password', autocomplete: 'new-password' }),
       clientSecret: field({ id: 'clientSecret', label: 'Sandbox Secret', type: 'password', autocomplete: 'new-password', hint: 'Sent once over this connection, stored encrypted, and never shown again.' }),
       url: field({ id: 'webhookEndpointUrl', label: 'Your webhook endpoint URL', hint: 'The URL in your own application that receives PayPal webhooks, such as http://localhost:4000/webhooks/paypal.' }),
     };
@@ -256,6 +256,7 @@
           clientSecret: f.clientSecret.input.value, webhookEndpointUrl: f.url.input.value,
         });
         f.clientSecret.input.value = '';
+        f.clientId.input.value = '';
         await loadProjects();
         await selectProject(data.project.id);
       } catch (ex) {
@@ -276,7 +277,7 @@
     const f = {
       name: field({ id: 'name', label: 'Project name', value: p.name }),
       url: field({ id: 'webhookEndpointUrl', label: 'Your webhook endpoint URL', value: p.webhookEndpointUrl }),
-      clientId: field({ id: 'clientId', label: 'New Sandbox Client ID', hint: 'Leave both credential fields empty to keep the current ones.' }),
+      clientId: field({ id: 'clientId', label: 'New Sandbox Client ID', type: 'password', autocomplete: 'new-password', hint: 'Leave both credential fields empty to keep the current ones.' }),
       clientSecret: field({ id: 'clientSecret', label: 'New Sandbox Secret', type: 'password', autocomplete: 'new-password' }),
     };
     const err = h('div', { role: 'alert' });
@@ -292,6 +293,7 @@
       try {
         const data = await api('PATCH', `/api/projects/${p.id}`, body);
         f.clientSecret.input.value = '';
+        f.clientId.input.value = '';
         state.detail = { project: data.project, checks: data.checks };
         state.view = 'detail';
         await loadProjects();
@@ -606,7 +608,7 @@
     state.overview = o; state.findings = fnd.findings; state.failedAssertions = fnd.failedAssertions || [];
     state.events = e.events; state.eventTotal = e.total; state.eventTypes = e.eventTypes; state.deliveries = d.deliveries; state.calls = c.calls; state.runs = r.runs;
     state.aiPlans = plans.plans; state.aiStatus = aiSt;
-    if (!state.aiSuggestions || state.aiSuggestions.source !== 'openai') state.aiSuggestions = sug;
+    if (!state.aiSuggestions || state.aiSuggestions.source === 'deterministic_coverage') state.aiSuggestions = sug;
     if (state.aiSelectedPlan) state.aiSelectedPlan = state.aiPlans.find((x) => x.id === state.aiSelectedPlan.id) || state.aiPlans[0] || null;
     else if (state.aiPlans.length) state.aiSelectedPlan = state.aiPlans[0];
     const verified = state.events.filter((x) => x.verification.status === 'verified');
@@ -1258,12 +1260,13 @@
       renderMain();
     } }, 'Cancel') : null;
     const aiReady = Boolean(state.aiStatus && state.aiStatus.configured);
+    const providerTitle = state.aiStatus && state.aiStatus.providerTitle ? state.aiStatus.providerTitle : (state.aiStatus && state.aiStatus.provider === 'gemini' ? 'Gemini' : (state.aiStatus && state.aiStatus.provider === 'openai' ? 'OpenAI' : 'AI'));
     const canAnalyze = ['completed', 'failed', 'cancelled'].includes(run.status);
     const analyzeBtn = canAnalyze ? h('button', {
       class: 'btn primary',
       type: 'button',
       disabled: !aiReady,
-      title: aiReady ? '' : 'Set OPENAI_API_KEY in your server .env file and restart Faultline to enable OpenAI trace analysis.',
+      title: aiReady ? '' : 'Set GEMINI_API_KEY or OPENAI_API_KEY in your server .env file and restart Faultline to enable AI trace analysis.',
       onclick: async () => {
         analyzeBtn.disabled = true; analyzeBtn.textContent = 'Analyzing evidence\u2026';
         state.aiAnalysisError = null;
@@ -1278,7 +1281,7 @@
         }
         renderMain();
       },
-    }, aiAnalysis ? 'Re-analyze evidence (OpenAI)' : 'Analyze with AI Test Engineer') : null;
+    }, aiAnalysis ? `Re-analyze evidence (${providerTitle})` : `Analyze with AI Test Engineer (${providerTitle})`) : null;
     const secs = (ms) => (ms === null || ms === undefined ? '\u2014' : `${(ms / 1000).toFixed(1)} s`);
     const attemptRows = attempts.map((a) => h('tr', null,
       h('td', null, `${a.attemptNo} of ${run.plannedAttempts}`),
@@ -1681,19 +1684,20 @@ app.get('/faultline-probe', async (req, res) => {
   function aiEngineerPanel(p) {
     const aiSt = state.aiStatus;
     const aiReady = Boolean(aiSt && aiSt.configured);
-    const modelLabel = aiSt && aiSt.model ? aiSt.model : 'gpt-4o-mini';
+    const providerName = aiSt && aiSt.providerTitle ? aiSt.providerTitle : (aiSt && aiSt.provider === 'gemini' ? 'Google Gemini' : (aiSt && aiSt.provider === 'openai' ? 'OpenAI' : 'AI'));
+    const modelLabel = aiSt && aiSt.model ? aiSt.model : (aiSt && aiSt.provider === 'gemini' ? 'gemini-3.8-flash' : 'gpt-4o-mini');
 
     const statusBadgeEl = aiReady
-      ? h('span', { class: 'badge ok' }, `OpenAI (${modelLabel}) \u00B7 Configured`)
-      : h('span', { class: 'badge warn' }, 'OpenAI not configured');
+      ? h('span', { class: 'badge ok' }, `${providerName} (${modelLabel}) \u00B7 Configured`)
+      : h('span', { class: 'badge warn' }, 'AI not configured');
 
     const setupNotice = aiReady
       ? h('div', { class: 'alert idle', role: 'status' },
-        h('strong', null, `OpenAI connected (${modelLabel}) \u00B7 Strict deterministic & privacy guardrails active.`),
-        h('p', { class: 'alert-text' }, 'Only allow-listed, sanitized event/run metadata is sent to OpenAI (never PayPal secrets, OAuth tokens, encryption keys, or raw webhook bodies). Every model output is validated against strict schemas before saving, execution requires your confirmation, and deterministic checks in src/checks.js remain the sole source of test verdicts.'))
+        h('strong', null, `${providerName} connected (${modelLabel}) \u00B7 Strict deterministic & privacy guardrails active.`),
+        h('p', { class: 'alert-text' }, `Only allow-listed, sanitized event/run metadata is sent to ${providerName} (never PayPal secrets, OAuth tokens, encryption keys, or raw webhook bodies). Every model output is validated against strict schemas before saving, execution requires your confirmation, and deterministic checks in src/checks.js remain the sole source of test verdicts.`))
       : h('div', { class: 'alert warn', role: 'status' },
-        h('strong', null, 'AI features are unavailable because OPENAI_API_KEY is not configured.'),
-        h('p', { class: 'alert-text' }, `To enable OpenAI test planning, trace explanations, and AI follow-up suggestions, set OPENAI_API_KEY=<your_key> (and optional OPENAI_MODEL=${modelLabel}) in your server .env file and restart Faultline. All PayPal Sandbox order/capture operations, webhook signature verification, Test Lab fault scenarios, and deterministic safety checks work without an AI key.`));
+        h('strong', null, 'AI features are unavailable because neither GEMINI_API_KEY nor OPENAI_API_KEY is configured.'),
+        h('p', { class: 'alert-text' }, `To enable AI test planning, trace explanations, and AI follow-up suggestions, set GEMINI_API_KEY (default model: gemini-3.8-flash) or OPENAI_API_KEY (default model: gpt-4o-mini) in your server .env file and restart Faultline. All PayPal Sandbox order/capture operations, webhook signature verification, Test Lab fault scenarios, and deterministic safety checks work without an AI key.`));
 
     const promptInput = h('input', {
       id: 'aiPrompt',
@@ -1707,11 +1711,11 @@ app.get('/faultline-probe', async (req, res) => {
       class: 'btn primary',
       type: 'submit',
       disabled: !aiReady,
-      title: aiReady ? '' : 'Set OPENAI_API_KEY in .env and restart Faultline to enable AI test planning.',
-    }, 'Generate test plan (OpenAI)');
+      title: aiReady ? '' : 'Set GEMINI_API_KEY or OPENAI_API_KEY in .env and restart Faultline to enable AI test planning.',
+    }, `Generate test plan (${providerName})`);
     const planForm = h('form', { class: 'row-form', novalidate: true, onsubmit: async (e) => {
       e.preventDefault();
-      planBtn.disabled = true; planBtn.textContent = 'Planning with OpenAI\u2026';
+      planBtn.disabled = true; planBtn.textContent = `Planning with ${providerName}\u2026`;
       state.aiPlanError = null;
       try {
         const data = await api('POST', `/api/projects/${p.id}/ai/plans`, { prompt: state.aiPrompt });
@@ -1751,7 +1755,7 @@ app.get('/faultline-probe', async (req, res) => {
       class: 'btn primary',
       type: 'button',
       disabled: !aiReady,
-      title: aiReady ? '' : 'Set OPENAI_API_KEY in .env and restart Faultline to enable AI run analysis.',
+      title: aiReady ? '' : 'Set GEMINI_API_KEY or OPENAI_API_KEY in .env and restart Faultline to enable AI run analysis.',
       onclick: async () => {
         const targetId = runSelect ? runSelect.value : currentRunId;
         if (!targetId) return;
@@ -1770,18 +1774,18 @@ app.get('/faultline-probe', async (req, res) => {
         }
         renderMain();
       },
-    }, 'Explain run from evidence (OpenAI)') : null;
+    }, `Explain run from evidence (${providerName})`) : null;
 
     // Suggestions section
     const sug = state.aiSuggestions;
-    const isAiSuggestions = Boolean(sug && sug.source === 'openai');
+    const isAiSuggestions = Boolean(sug && sug.source && sug.source !== 'deterministic_coverage');
     const generateSugBtn = h('button', {
       class: 'btn primary',
       type: 'button',
       disabled: !aiReady,
-      title: aiReady ? '' : 'Set OPENAI_API_KEY in .env and restart Faultline to generate OpenAI follow-up suggestions.',
+      title: aiReady ? '' : 'Set GEMINI_API_KEY or OPENAI_API_KEY in .env and restart Faultline to generate AI follow-up suggestions.',
       onclick: async () => {
-        generateSugBtn.disabled = true; generateSugBtn.textContent = 'Asking OpenAI\u2026';
+        generateSugBtn.disabled = true; generateSugBtn.textContent = `Asking ${providerName}\u2026`;
         state.aiSuggestionError = null;
         try {
           state.aiSuggestions = await api('POST', `/api/projects/${p.id}/ai/suggestions`, {});
@@ -1791,7 +1795,7 @@ app.get('/faultline-probe', async (req, res) => {
         }
         renderMain();
       },
-    }, isAiSuggestions ? 'Refresh AI suggestions (OpenAI)' : 'Generate AI suggestions (OpenAI)');
+    }, isAiSuggestions ? `Refresh AI suggestions (${providerName})` : `Generate AI suggestions (${providerName})`);
 
     const suggestionRows = (sug && sug.suggestions ? sug.suggestions : []).map((s) => h('tr', null,
       h('td', null, h('strong', null, s.title), h('div', { class: 'hint block mono' }, `${s.eventType} \u00B7 ${s.paypalEventId || s.eventId}`)),
@@ -1821,7 +1825,7 @@ app.get('/faultline-probe', async (req, res) => {
         h('h2', { class: 'section nomargin' }, 'AI Test Engineer'),
         statusBadgeEl,
         h('span', { class: 'badge idle' }, 'Deterministic verdicts only')),
-      h('p', { class: 'hint-text' }, 'Uses OpenAI to interpret plain-English reliability requests into schema-validated test plans, explain completed runs from sanitized execution traces, and suggest follow-up tests. The model can never initiate PayPal financial operations, fabricate events, or decide/override a test verdict.'),
+      h('p', { class: 'hint-text' }, `Uses ${providerName} (${modelLabel}) to interpret plain-English reliability requests into schema-validated test plans, explain completed runs from sanitized execution traces, and suggest follow-up tests. The model can never initiate PayPal financial operations, fabricate events, or decide/override a test verdict.`),
       setupNotice,
       planForm,
       quickBtns,

@@ -40,9 +40,12 @@ function readCookie(req, name) {
 function createApp({ config, db, paypal, ai }) {
   const cipher = createCipher(config.encryptionKey);
   const aiProvider = ai || createAiProvider({
-    apiKey: config.openaiApiKey || null,
-    model: config.openaiModel || 'gpt-4o-mini',
-    timeoutMs: config.openaiTimeoutMs || 15000,
+    provider: config.aiProvider || 'auto',
+    geminiApiKey: config.geminiApiKey || null,
+    geminiModel: config.geminiModel || 'gemini-3.8-flash',
+    openaiApiKey: config.openaiApiKey || null,
+    openaiModel: config.openaiModel || 'gpt-4o-mini',
+    timeoutMs: config.aiTimeoutMs || config.openaiTimeoutMs || 15000,
   });
   const app = express();
   app.disable('x-powered-by');
